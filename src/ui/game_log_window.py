@@ -28,10 +28,10 @@ class GameLogWindow(QDialog):
         super().__init__(parent)
         self._is_game_running = False
         self._exit_code = None
-        self._setup_ui()
-        self._setup_colors()
         self._log_count = 0
         self._max_lines = 10000
+        self._setup_colors()
+        self._setup_ui()
 
     def _setup_ui(self) -> None:
         self.setWindowTitle(self.tr("游戏日志"))
