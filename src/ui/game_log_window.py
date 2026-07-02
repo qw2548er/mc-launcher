@@ -29,7 +29,7 @@ class GameLogWindow(QDialog):
         self._is_game_running = False
         self._exit_code = None
         self._log_count = 0
-        self._max_lines = 10000
+        self._max_lines = 1000
         self._setup_colors()
         self._setup_ui()
 
