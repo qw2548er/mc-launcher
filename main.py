@@ -206,7 +206,6 @@ def main() -> int:
             java_version = None
             try:
                 from src.core.java_detector import JavaDetector
-                from pathlib import Path
                 detector = JavaDetector()
                 java_info = detector.check_java(Path(java_path))
                 if java_info:
