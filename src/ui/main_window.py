@@ -438,7 +438,7 @@ class MainWindow(QMainWindow):
     def _load_account_avatar(self, account):
         try:
             from src.core.skin_manager import get_skin_manager
-            from PyQt6.QtCore import QThread, pyqtSignal as Signal
+            from PyQt6.QtCore import pyqtSignal as Signal
 
             class _AvatarThread(QThread):
                 loaded = Signal(str, str)
@@ -459,7 +459,6 @@ class MainWindow(QMainWindow):
 
             def on_avatar(uuid_str, path):
                 try:
-                    from PyQt6.QtGui import QPixmap
                     pm = QPixmap(path)
                     if not pm.isNull():
                         scaled = pm.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
@@ -489,7 +488,6 @@ class MainWindow(QMainWindow):
             return
         self._account_manager.switch_account(account_uuid)
         self._refresh_account_display()
-        from .widgets import Toast
         acc = self._account_manager.get_selected()
         if acc:
             Toast.success(self, self.tr("已切换到: ") + acc.username)
@@ -1517,7 +1515,6 @@ class MainWindow(QMainWindow):
 
         selected_java = None
         if java_path and java_path != self.tr("自动选择最合适的 Java"):
-            from pathlib import Path
             selected_java = self._java_detector.check_java(Path(java_path))
         else:
             selected_java = self._java_detector.get_best_match(self._selected_version)
