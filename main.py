@@ -111,9 +111,15 @@ def detect_java() -> str | None:
     try:
         from src.core.java_detector import JavaDetector
         detector = JavaDetector()
-        javas = detector.find_all_java()
+        javas = detector.scan()
         if javas:
-            best = detector.find_best_java(major=17) or javas[0]
+            best = None
+            for j in javas:
+                if j.major_version >= 17:
+                    best = j
+                    break
+            if best is None:
+                best = javas[0]
             logger.info("检测到 Java: %s (版本 %s)", best.path, best.version)
             return str(best.path)
     except Exception as e:
@@ -200,8 +206,9 @@ def main() -> int:
             java_version = None
             try:
                 from src.core.java_detector import JavaDetector
+                from pathlib import Path
                 detector = JavaDetector()
-                java_info = detector.get_java_info(java_path)
+                java_info = detector.check_java(Path(java_path))
                 if java_info:
                     java_version = java_info.version
             except Exception:
@@ -216,43 +223,13 @@ def main() -> int:
         window.set_game_dir(game_dir)
         window.set_memory_allocation(max(1, max_mem // 1024))
 
-    window.set_account_info("Steve", is_microsoft=False)
+    from src.utils.config import get_config
+    config = get_config()
+    config.load()
 
-    def on_launch(version_id: str):
-        from src.core.launcher import MinecraftLauncher, LaunchOptions
-        from src.utils.config import get_config
-        config = get_config()
+    saved_username = config.get("offline_username", "Steve")
+    window.set_account_info(saved_username, is_microsoft=False)
 
-        try:
-            launcher = MinecraftLauncher()
-            options = LaunchOptions(
-                version=version_id,
-                game_directory=Path(window.get_game_dir()),
-                java_path=Path(window.get_java_path()) if window.get_java_path() else None,
-                max_memory_mb=window.get_memory_allocation() * 1024,
-            )
-            process = launcher.launch(options)
-            if process:
-                Toast.info(f"Minecraft {version_id} 已启动！")
-                window.hide()
-
-                def check_process():
-                    try:
-                        if process.poll() is not None:
-                            window.show()
-                            return
-                    except Exception:
-                        pass
-                    QTimer.singleShot(2000, check_process)
-
-                QTimer.singleShot(5000, check_process)
-            else:
-                Toast.error("启动失败，请检查 Java 路径和版本")
-        except Exception as e:
-            logger.error("启动游戏失败: %s", e, exc_info=True)
-            Toast.error(f"启动失败: {e}")
-
-    window.launch_clicked.connect(on_launch)
     window.version_selected.connect(
         lambda v: logger.info("选择版本: %s", v)
     )

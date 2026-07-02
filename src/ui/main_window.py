@@ -1,12 +1,13 @@
 """主窗口模块。
 
 实现 Minecraft 启动器的主界面，包含版本列表、启动按钮、快速设置和状态栏。
-集成真实版本管理、下载进度显示功能。
+集成真实版本管理、下载进度显示、游戏启动和日志显示功能。
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -20,13 +21,14 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QComboBox, QSlider, QStatusBar, QFrame,
     QFileDialog, QSizePolicy, QScrollArea, QStackedWidget, QSpacerItem,
-    QGridLayout, QMessageBox, QApplication
+    QGridLayout, QMessageBox, QApplication, QInputDialog
 )
 
 from .widgets import (
     TitleBar, CardWidget, Toast, ToastType, LoadingSpinner, VersionListItem
 )
 from .styles import ThemeManager, Theme
+from .game_log_window import GameLogWindow
 
 logger = logging.getLogger(__name__)
 
@@ -129,14 +131,121 @@ class DownloadThread(QThread):
             self.download_finished.emit(False, str(e))
 
 
+class LaunchThread(QThread):
+    launch_started = pyqtSignal()
+    launch_progress = pyqtSignal(str)
+    launch_log = pyqtSignal(str, str)
+    launch_finished = pyqtSignal(bool, str)
+    game_exited = pyqtSignal(int)
+
+    def __init__(
+        self,
+        version_id: str,
+        username: str,
+        java_path: str,
+        game_dir: str,
+        max_memory_gb: int,
+        extra_jvm_args: str = "",
+    ):
+        super().__init__()
+        self._version_id = version_id
+        self._username = username
+        self._java_path = java_path
+        self._game_dir = Path(game_dir)
+        self._max_memory_gb = max_memory_gb
+        self._extra_jvm_args = extra_jvm_args
+        self._launcher = None
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+        if self._launcher:
+            self._launcher.kill()
+
+    def run(self):
+        try:
+            from src.core.launcher import GameLauncher, LaunchError
+            from src.core.account import AccountInfo
+            import uuid
+
+            self.launch_started.emit()
+            self.launch_progress.emit("正在初始化启动器...")
+
+            launcher = GameLauncher()
+            self._launcher = launcher
+
+            account_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, f"offline:{self._username}"))
+            account = AccountInfo(
+                uuid=account_uuid,
+                type="offline",
+                username=self._username,
+            )
+
+            java_path = Path(self._java_path) if self._java_path else None
+
+            def on_log(line: str, level: str):
+                self.launch_log.emit(line, level)
+
+            def on_progress(status: str):
+                self.launch_progress.emit(status)
+
+            def on_exit(exit_code: int):
+                self.game_exited.emit(exit_code)
+
+            self.launch_progress.emit("正在执行启动前检查...")
+
+            max_mem_mb = self._max_memory_gb * 1024
+            check_result = launcher.pre_check(
+                self._version_id,
+                game_dir=self._game_dir,
+                java_path=java_path,
+                max_memory_mb=max_mem_mb
+            )
+
+            if not check_result.can_launch:
+                error_msg = check_result.get_error_message()
+                if check_result.warnings:
+                    error_msg += "\n\n警告:\n" + check_result.get_warning_message()
+                self.launch_finished.emit(False, error_msg)
+                return
+
+            if check_result.warnings:
+                logger.warning("启动前检查警告:\n%s", check_result.get_warning_message())
+
+            self.launch_progress.emit("正在启动游戏...")
+
+            process = launcher.launch(
+                version_id=self._version_id,
+                account=account,
+                java_path=java_path,
+                max_memory_mb=max_mem_mb,
+                min_memory_mb=min(512, max_mem_mb // 2),
+                game_dir=self._game_dir,
+                on_log=on_log,
+                on_exit=on_exit,
+                on_progress=on_progress,
+                extra_jvm_args=self._extra_jvm_args if self._extra_jvm_args else None,
+            )
+
+            self.launch_finished.emit(True, "")
+
+            process.wait()
+
+        except Exception as e:
+            logger.error("启动游戏异常: %s", e, exc_info=True)
+            self.launch_finished.emit(False, str(e))
+
+
 class MainWindow(QMainWindow):
     launch_clicked = pyqtSignal(str)
     version_selected = pyqtSignal(str)
+    close_game_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self._selected_version: Optional[str] = None
         self._is_launching = False
+        self._is_game_running = False
         self._drag_position = None
         self._version_manager = None
         self._version_items: dict[str, VersionListItem] = {}
@@ -145,7 +254,11 @@ class MainWindow(QMainWindow):
         self._latest_release: str = ""
         self._latest_snapshot: str = ""
         self._download_thread: Optional[DownloadThread] = None
+        self._launch_thread: Optional[LaunchThread] = None
         self._downloading_version: Optional[str] = None
+        self._launcher = None
+        self._log_window: Optional[GameLogWindow] = None
+        self._game_hide_launcher = True
 
         self._setup_window()
         self._setup_ui()
@@ -172,9 +285,53 @@ class MainWindow(QMainWindow):
             game_dir = Path(config.get("game_directory", str(Path.home() / ".minecraft")))
             self._version_manager = VersionManager(game_dir=game_dir)
             self._load_versions(force_refresh=False)
+            self._init_launcher()
         except Exception as e:
             logger.error("初始化版本管理器失败: %s", e, exc_info=True)
             Toast.error(f"版本管理器初始化失败: {e}")
+
+    def _init_launcher(self):
+        try:
+            from src.core.java_detector import JavaDetector
+            from src.utils.config import get_config
+            config = get_config()
+            detector = JavaDetector()
+            javas = detector.scan()
+            self._java_path_combo.clear()
+            self._java_path_combo.addItem(self.tr("自动检测"), "")
+            for j in javas:
+                self._java_path_combo.addItem(f"Java {j.major_version} - {j.path}", str(j.path))
+
+            saved_java = config.get("java_path", "")
+            if saved_java:
+                idx = self._java_path_combo.findData(saved_java)
+                if idx >= 0:
+                    self._java_path_combo.setCurrentIndex(idx)
+                else:
+                    self._java_path_combo.addItem(saved_java, saved_java)
+                    self._java_path_combo.setCurrentIndex(self._java_path_combo.count() - 1)
+
+            game_dir = config.get("game_directory", str(Path.home() / ".minecraft"))
+            if self._game_dir_combo.findText(game_dir) == -1:
+                self._game_dir_combo.addItem(game_dir)
+            self._game_dir_combo.setCurrentText(game_dir)
+
+            max_mem_mb = config.get("java_args.max_memory_mb", 4096)
+            max_mem_gb = max(1, max_mem_mb // 1024)
+            self._memory_slider.setValue(max_mem_gb)
+            self._memory_value.setText(f"{max_mem_gb} GB")
+
+            saved_username = config.get("offline_username", "Steve")
+            self.set_account_info(saved_username, is_microsoft=False)
+
+            if javas:
+                best = javas[0]
+                self.set_java_status(best.version)
+            else:
+                self.set_java_status(self.tr("未检测到"))
+
+        except Exception as e:
+            logger.error("初始化 Java 检测器失败: %s", e, exc_info=True)
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -321,6 +478,13 @@ class MainWindow(QMainWindow):
         text_col.addWidget(self._account_label)
 
         top_row.addLayout(text_col, 1)
+
+        self._change_name_btn = QPushButton(self.tr("更改用户名"))
+        self._change_name_btn.setObjectName("SecondaryButton")
+        self._change_name_btn.setFixedHeight(32)
+        self._change_name_btn.clicked.connect(self._change_username)
+        top_row.addWidget(self._change_name_btn)
+
         wl.addLayout(top_row)
 
         parent_layout.addWidget(welcome_card)
@@ -346,16 +510,29 @@ class MainWindow(QMainWindow):
 
         ll.addLayout(version_row)
 
+        self._launch_status = QLabel("")
+        self._launch_status.setStyleSheet("color: #9CA3AF; font-size: 13px;")
+        self._launch_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._launch_status.hide()
+        ll.addWidget(self._launch_status)
+
         btn_row = QHBoxLayout()
         btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        btn_row.setSpacing(12)
 
         self._launch_btn = QPushButton(self.tr("启动游戏"))
         self._launch_btn.setObjectName("LaunchButton")
-        self._launch_btn.setFixedSize(280, 70)
+        self._launch_btn.setFixedSize(220, 60)
         self._launch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._launch_btn.clicked.connect(self._on_launch)
         self._launch_btn.setEnabled(False)
         btn_row.addWidget(self._launch_btn)
+
+        self._log_btn = QPushButton(self.tr("游戏日志"))
+        self._log_btn.setObjectName("SecondaryButton")
+        self._log_btn.setFixedSize(120, 60)
+        self._log_btn.clicked.connect(self._show_log_window)
+        btn_row.addWidget(self._log_btn)
 
         ll.addLayout(btn_row)
 
@@ -394,9 +571,7 @@ class MainWindow(QMainWindow):
         self._memory_value.setMinimumWidth(60)
         self._memory_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         mem_row.addWidget(self._memory_value)
-        self._memory_slider.valueChanged.connect(
-            lambda v: self._memory_value.setText(f"{v} GB")
-        )
+        self._memory_slider.valueChanged.connect(self._on_memory_changed)
         grid.addLayout(mem_row, 0, 1)
 
         java_label = QLabel(self.tr("Java 路径"))
@@ -423,8 +598,6 @@ class MainWindow(QMainWindow):
         dir_row.setSpacing(8)
         self._game_dir_combo = QComboBox()
         self._game_dir_combo.setEditable(True)
-        default_dir = str(Path.home() / ".minecraft")
-        self._game_dir_combo.addItem(default_dir)
         dir_row.addWidget(self._game_dir_combo, 1)
         self._browse_dir_btn = QPushButton(self.tr("浏览"))
         self._browse_dir_btn.setObjectName("IconButton")
@@ -456,6 +629,15 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         show_action = tray_menu.addAction(self.tr("显示主窗口"))
         show_action.triggered.connect(self._show_from_tray)
+
+        show_log_action = tray_menu.addAction(self.tr("显示游戏日志"))
+        show_log_action.triggered.connect(self._show_log_window)
+
+        tray_menu.addSeparator()
+        self._kill_action = tray_menu.addAction(self.tr("终止游戏"))
+        self._kill_action.setEnabled(False)
+        self._kill_action.triggered.connect(self._kill_game)
+
         tray_menu.addSeparator()
         quit_action = tray_menu.addAction(self.tr("退出"))
         quit_action.triggered.connect(QApplication.instance().quit)
@@ -467,6 +649,9 @@ class MainWindow(QMainWindow):
         self._version_list.currentItemChanged.connect(self._on_version_changed)
         self._refresh_btn.clicked.connect(self._refresh_versions)
         self._filter_combo.currentIndexChanged.connect(self._apply_filter)
+        self.close_game_requested.connect(self._kill_game)
+        self._java_path_combo.editTextChanged.connect(self._on_java_path_changed)
+        self._game_dir_combo.editTextChanged.connect(self._on_game_dir_changed)
 
     def _load_versions(self, force_refresh: bool = False):
         if self._version_manager is None:
@@ -498,6 +683,13 @@ class MainWindow(QMainWindow):
                 item = self._version_list.item(i)
                 widget = self._version_list.itemWidget(item)
                 if isinstance(widget, VersionListItem) and widget.version_id == default_ver:
+                    self._version_list.setCurrentItem(item)
+                    break
+        elif installed_ids:
+            for i in range(self._version_list.count()):
+                item = self._version_list.item(i)
+                widget = self._version_list.itemWidget(item)
+                if isinstance(widget, VersionListItem) and widget.is_installed:
                     self._version_list.setCurrentItem(item)
                     break
 
@@ -567,6 +759,16 @@ class MainWindow(QMainWindow):
             self._title_bar.set_maximized_state(True)
 
     def _on_close(self) -> None:
+        if self._is_game_running:
+            reply = QMessageBox.question(
+                self,
+                self.tr("确认退出"),
+                self.tr("游戏正在运行中，确定要退出启动器吗？\n游戏将继续运行。"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self.hide()
         Toast.info(self.tr("启动器已最小化到系统托盘"))
 
@@ -579,27 +781,190 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._show_from_tray()
 
+    def _change_username(self) -> None:
+        from src.utils.config import get_config
+        config = get_config()
+        current_name = config.get("offline_username", "Steve")
+
+        name, ok = QInputDialog.getText(
+            self,
+            self.tr("更改用户名"),
+            self.tr("请输入玩家名（离线模式）:"),
+            text=current_name
+        )
+        if ok and name.strip():
+            name = name.strip()
+            if len(name) > 16:
+                Toast.error(self.tr("玩家名不能超过 16 个字符"))
+                return
+            if not name.replace("_", "").isalnum():
+                Toast.error(self.tr("玩家名只能包含字母、数字和下划线"))
+                return
+            config.set("offline_username", name)
+            config.save()
+            self.set_account_info(name, is_microsoft=False)
+            Toast.success(self.tr("用户名已更新为: ") + name)
+
     def _on_launch(self) -> None:
-        if self._is_launching or not self._selected_version:
+        if self._is_launching or self._is_game_running:
+            return
+
+        if not self._selected_version:
+            Toast.warning(self.tr("请先选择一个版本"))
             return
 
         if self._selected_version not in self._installed_ids:
-            Toast.warning("该版本尚未安装，请先下载")
+            Toast.warning(self.tr("该版本尚未安装，请先下载"))
             return
+
+        from src.utils.config import get_config
+        config = get_config()
+        username = config.get("offline_username", "Steve")
+
+        java_path = self._java_path_combo.currentData()
+        if not java_path:
+            java_path = self._java_path_combo.currentText()
+        if java_path == self.tr("自动检测"):
+            java_path = ""
+
+        game_dir = self._game_dir_combo.currentText()
+        if not game_dir:
+            game_dir = str(Path.home() / ".minecraft")
+
+        max_memory_gb = self._memory_slider.value()
 
         self._is_launching = True
         self._launch_btn.setEnabled(False)
         self._launch_btn.setText(self.tr("启动中..."))
+        self._launch_spinner.show()
         self._launch_spinner.start()
-        self.launch_clicked.emit(self._selected_version)
-        QTimer.singleShot(3000, self._reset_launch_button)
+        self._launch_status.show()
+        self._launch_status.setText(self.tr("正在检查启动环境..."))
+        self.set_download_status(self.tr("正在启动 Minecraft ") + self._selected_version + "...")
+
+        self._log_window = GameLogWindow(self)
+        self._log_window.set_game_running(True, self._selected_version)
+        self._log_window.kill_requested.connect(self._kill_game)
+
+        self._launch_thread = LaunchThread(
+            version_id=self._selected_version,
+            username=username,
+            java_path=java_path,
+            game_dir=game_dir,
+            max_memory_gb=max_memory_gb,
+        )
+        self._launch_thread.launch_started.connect(self._on_launch_started)
+        self._launch_thread.launch_progress.connect(self._on_launch_progress)
+        self._launch_thread.launch_log.connect(self._on_launch_log)
+        self._launch_thread.launch_finished.connect(self._on_launch_finished)
+        self._launch_thread.game_exited.connect(self._on_game_exited)
+        self._launch_thread.start()
+
+    def _on_launch_started(self):
+        pass
+
+    def _on_launch_progress(self, status: str):
+        self._launch_status.setText(status)
+        if self._log_window:
+            self._log_window.append_log(f"[Launcher] {status}", "INFO")
+
+    def _on_launch_log(self, line: str, level: str):
+        if self._log_window:
+            self._log_window.append_log(line, level)
+
+    def _on_launch_finished(self, success: bool, error_msg: str):
+        self._launch_spinner.stop()
+        self._launch_spinner.hide()
+
+        if success:
+            self._is_game_running = True
+            self._is_launching = False
+            self._launch_btn.setText(self.tr("游戏运行中"))
+            self._launch_btn.setEnabled(False)
+            self._launch_status.setText(self.tr("游戏已启动！"))
+            self._launch_status.setStyleSheet("color: #10B981; font-size: 13px;")
+            self._kill_action.setEnabled(True)
+            self.set_download_status(self.tr("Minecraft ") + self._selected_version + self.tr(" 运行中"))
+
+            self._log_window.show()
+
+            from src.utils.config import get_config
+            config = get_config()
+            self._game_hide_launcher = config.get("launch.close_launcher", True)
+
+            if self._game_hide_launcher:
+                QTimer.singleShot(2000, self._hide_launcher_after_launch)
+
+            Toast.success(self.tr("Minecraft ") + self._selected_version + self.tr(" 已启动！"))
+        else:
+            self._is_launching = False
+            self._launch_btn.setEnabled(True)
+            self._launch_btn.setText(self.tr("启动游戏"))
+            self._launch_status.setText(self.tr("启动失败"))
+            self._launch_status.setStyleSheet("color: #EF4444; font-size: 13px;")
+            self.set_download_status(self.tr("启动失败"))
+
+            if self._log_window:
+                self._log_window.append_log(f"\n[Launcher] 启动失败: {error_msg}", "ERROR")
+                self._log_window.show()
+
+            QMessageBox.critical(
+                self,
+                self.tr("启动失败"),
+                self.tr("无法启动 Minecraft:\n\n") + error_msg
+            )
+
+    def _hide_launcher_after_launch(self):
+        if self._is_game_running:
+            self.hide()
+
+    def _on_game_exited(self, exit_code: int):
+        self._is_game_running = False
+        self._is_launching = False
+        self._kill_action.setEnabled(False)
+
+        can_launch = (self._selected_version is not None and
+                      self._selected_version in self._installed_ids and
+                      self._downloading_version is None)
+        self._launch_btn.setEnabled(can_launch)
+        self._launch_btn.setText(self.tr("启动游戏"))
+        self._launch_status.hide()
+        self.set_download_status(f"共 {len(self._all_versions)} 个版本，已安装 {len(self._installed_ids)} 个")
+
+        if self._log_window:
+            self._log_window.on_game_exit(exit_code)
+
+        if self._game_hide_launcher and self.isHidden():
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+
+        if exit_code == 0:
+            Toast.info(self.tr("游戏已退出"))
+        else:
+            Toast.warning(self.tr(f"游戏异常退出 (退出码: {exit_code})"))
+
+    def _kill_game(self):
+        if self._launch_thread:
+            self._launch_thread.cancel()
+            self._is_game_running = False
+            self._kill_action.setEnabled(False)
+
+    def _show_log_window(self):
+        if self._log_window is None:
+            self._log_window = GameLogWindow(self)
+            self._log_window.kill_requested.connect(self._kill_game)
+        self._log_window.show()
+        self._log_window.activateWindow()
+        self._log_window.raise_()
 
     def _reset_launch_button(self) -> None:
         self._is_launching = False
         self._launch_spinner.stop()
         can_launch = (self._selected_version is not None and
                       self._selected_version in self._installed_ids and
-                      self._downloading_version is None)
+                      self._downloading_version is None and
+                      not self._is_game_running)
         self._launch_btn.setEnabled(can_launch)
         self._launch_btn.setText(self.tr("启动游戏"))
 
@@ -614,7 +979,8 @@ class MainWindow(QMainWindow):
             self._selected_version = widget.version_id
             self._version_display.setText(widget.version_id)
             can_launch = (widget.version_id in self._installed_ids and
-                          self._downloading_version is None)
+                          self._downloading_version is None and
+                          not self._is_game_running)
             self._launch_btn.setEnabled(can_launch)
             self.version_selected.emit(widget.version_id)
 
@@ -625,6 +991,9 @@ class MainWindow(QMainWindow):
     def _start_download(self, version_id: str):
         if self._downloading_version is not None:
             Toast.warning(f"已有版本正在下载: {self._downloading_version}")
+            return
+        if self._is_game_running:
+            Toast.warning(self.tr("游戏正在运行中，请先退出游戏"))
             return
 
         reply = QMessageBox.question(
@@ -668,6 +1037,10 @@ class MainWindow(QMainWindow):
                 Toast.info("下载已取消")
 
     def _delete_version(self, version_id: str):
+        if self._is_game_running:
+            Toast.warning(self.tr("游戏正在运行中，请先退出游戏"))
+            return
+
         reply = QMessageBox.warning(
             self,
             "删除版本",
@@ -692,6 +1065,9 @@ class MainWindow(QMainWindow):
                 if config.get("default_version", "") == version_id:
                     config.set("default_version", "")
                     config.save()
+
+                if self._selected_version == version_id:
+                    self._launch_btn.setEnabled(False)
             else:
                 Toast.error(f"删除版本 {version_id} 失败")
         except Exception as e:
@@ -728,13 +1104,41 @@ class MainWindow(QMainWindow):
             config.save()
 
             if self._selected_version == version_id:
-                self._launch_btn.setEnabled(True)
+                self._launch_btn.setEnabled(not self._is_game_running)
         else:
             if widget:
                 widget.set_error(message)
             Toast.error(f"下载 {version_id} 失败: {message}")
 
         self.set_download_status(f"共 {len(self._all_versions)} 个版本，已安装 {len(self._installed_ids)} 个")
+
+    def _on_memory_changed(self, value: int) -> None:
+        self._memory_value.setText(f"{value} GB")
+        try:
+            from src.utils.config import get_config
+            config = get_config()
+            config.set("java_args.max_memory_mb", value * 1024)
+            config.save()
+        except Exception:
+            pass
+
+    def _on_java_path_changed(self, text: str) -> None:
+        try:
+            from src.utils.config import get_config
+            config = get_config()
+            config.set("java_path", text)
+            config.save()
+        except Exception:
+            pass
+
+    def _on_game_dir_changed(self, text: str) -> None:
+        try:
+            from src.utils.config import get_config
+            config = get_config()
+            config.set("game_directory", text)
+            config.save()
+        except Exception:
+            pass
 
     def _browse_java(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -796,9 +1200,14 @@ class MainWindow(QMainWindow):
         self._memory_slider.setValue(gb)
 
     def set_java_path(self, path: str) -> None:
-        if self._java_path_combo.findText(path) == -1:
-            self._java_path_combo.addItem(path)
-        self._java_path_combo.setCurrentText(path)
+        idx = self._java_path_combo.findData(path)
+        if idx >= 0:
+            self._java_path_combo.setCurrentIndex(idx)
+        elif self._java_path_combo.findText(path) == -1:
+            self._java_path_combo.addItem(path, path)
+            self._java_path_combo.setCurrentIndex(self._java_path_combo.count() - 1)
+        else:
+            self._java_path_combo.setCurrentText(path)
 
     def set_game_dir(self, path: str) -> None:
         if self._game_dir_combo.findText(path) == -1:

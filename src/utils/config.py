@@ -13,13 +13,18 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+def _get_default_game_dir() -> str:
+    return str(Path.home() / ".minecraft")
+
+
 # 默认配置
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "game_directory": ".minecraft",
+    "game_directory": _get_default_game_dir(),
     "java_path": "",
+    "offline_username": "Steve",
     "java_args": {
         "min_memory_mb": 512,
-        "max_memory_mb": 2048,
+        "max_memory_mb": 4096,
         "extra_args": "-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions",
     },
     "launch": {
@@ -46,6 +51,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "default_version": "",
     "default_account": "",
+    "last_launch": {
+        "version": "",
+        "time": "",
+        "launch_count": 0,
+    },
 }
 
 
@@ -74,6 +84,7 @@ class ConfigManager:
         self._config_path: Path = Path("config/settings.json")
         self._rw_lock = threading.RLock()
         self._initialized = True
+        self.load()
 
     # ── 文件操作 ──────────────────────────────────────────────
 
