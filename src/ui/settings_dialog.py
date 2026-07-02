@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (
     QDialog, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QTabWidget, QLineEdit, QSpinBox, QSlider, QComboBox, QCheckBox,
     QGroupBox, QFileDialog, QScrollArea, QFrame, QGridLayout, QSizePolicy,
-    QMessageBox, QTextEdit, QRadioButton, QButtonGroup, QSpacerItem
+    QMessageBox, QTextEdit, QRadioButton, QButtonGroup, QSpacerItem,
+    QSplitter
 )
 
 from .widgets import DialogTitleBar
@@ -180,28 +181,11 @@ class SettingsDialog(QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(32, 28, 32, 28)
-        layout.setSpacing(20)
+        layout.setSpacing(16)
 
-        java_group = QGroupBox(self.tr("Java 配置"))
-        java_layout = QGridLayout()
-        java_layout.setSpacing(14)
-
-        java_layout.addWidget(QLabel(self.tr("Java 路径")), 0, 0)
-        java_path_row = QHBoxLayout()
-        self._java_path_edit = QLineEdit()
-        self._java_path_edit.setPlaceholderText(self.tr("自动检测"))
-        java_path_row.addWidget(self._java_path_edit, 1)
-        self._java_browse_btn = QPushButton(self.tr("浏览"))
-        self._java_browse_btn.setObjectName("IconButton")
-        self._java_browse_btn.clicked.connect(self._browse_java)
-        java_path_row.addWidget(self._java_browse_btn)
-        java_layout.addLayout(java_path_row, 0, 1)
-
-        self._auto_detect_btn = QPushButton(self.tr("自动检测 Java"))
-        java_layout.addWidget(self._auto_detect_btn, 1, 1)
-
-        java_group.setLayout(java_layout)
-        layout.addWidget(java_group)
+        from .java_manager import JavaManagerWidget
+        self._java_manager = JavaManagerWidget(self)
+        layout.addWidget(self._java_manager, 1)
 
         mem_group = QGroupBox(self.tr("内存分配"))
         mem_layout = QGridLayout()
@@ -234,14 +218,13 @@ class SettingsDialog(QDialog):
         self._jvm_args_edit.setPlaceholderText(
             "-XX:+UnlockExperimentalVMOptions\n-XX:+UseG1GC"
         )
-        self._jvm_args_edit.setMaximumHeight(100)
+        self._jvm_args_edit.setMaximumHeight(80)
         jvm_layout.addWidget(self._jvm_args_edit)
         jvm_hint = QLabel(self.tr("每行一个参数，留空使用默认参数"))
         jvm_hint.setStyleSheet("color: #9CA3AF; font-size: 12px;")
         jvm_layout.addWidget(jvm_hint)
         jvm_group.setLayout(jvm_layout)
         layout.addWidget(jvm_group)
-        layout.addStretch()
 
         self._content_stack.addTab(page, "java")
 
@@ -443,14 +426,6 @@ class SettingsDialog(QDialog):
         if 0 <= index < len(colors):
             ThemeManager.instance().set_accent_color(colors[index])
 
-    def _browse_java(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, self.tr("选择 Java 可执行文件"), "",
-            "Java (*.exe java);;所有文件 (*)"
-        )
-        if path:
-            self._java_path_edit.setText(path)
-
     def _browse_game_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self, self.tr("选择游戏目录"), str(Path.home())
@@ -481,6 +456,27 @@ class SettingsDialog(QDialog):
         else:
             self._theme_combo.setCurrentIndex(1)
 
+        try:
+            from src.utils.config import get_config
+            config = get_config()
+
+            self._min_mem_spin.setValue(config.get("java_args.min_memory_mb", 2048) // 1024)
+            self._max_mem_spin.setValue(config.get("java_args.max_memory_mb", 4096) // 1024)
+            extra_args = config.get("java_args.extra_args", "")
+            self._jvm_args_edit.setPlainText(extra_args)
+
+            self._game_dir_edit.setText(config.get("game_directory", str(Path.home() / ".minecraft")))
+            self._width_spin.setValue(config.get("launch.window_width", 854))
+            self._height_spin.setValue(config.get("launch.window_height", 480))
+            self._fullscreen_check.setChecked(config.get("launch.fullscreen", False))
+            self._close_launcher_check.setChecked(config.get("launch.close_launcher", True))
+
+            saved_java = config.get("java_path", "")
+            if saved_java and hasattr(self, '_java_manager'):
+                self._java_manager.select_java_by_path(saved_java)
+        except Exception as e:
+            logger.debug("加载设置失败: %s", e)
+
     def _save_settings(self) -> None:
         theme_index = self._theme_combo.currentIndex()
         new_theme = Theme.DARK if theme_index == 0 else Theme.LIGHT
@@ -491,27 +487,46 @@ class SettingsDialog(QDialog):
         if 0 <= color_index < len(colors):
             ThemeManager.instance().set_accent_color(colors[color_index])
 
+        try:
+            from src.utils.config import get_config
+            from src.core.java_detector import JavaDetector
+            config = get_config()
+
+            selected_java = None
+            if hasattr(self, '_java_manager'):
+                selected_java = self._java_manager.get_selected_java()
+
+            config.set("theme", new_theme.value)
+            config.set("appearance.accent_color", color_index)
+            config.set("appearance.language", self._lang_combo.currentIndex())
+            config.set("autostart", self._autostart_check.isChecked())
+            config.set("minimize_to_tray", self._minimize_tray_check.isChecked())
+            config.set("check_update", self._check_update_check.isChecked())
+
+            if selected_java:
+                config.set("java_path", str(selected_java.path))
+            config.set("java_args.min_memory_mb", self._min_mem_spin.value() * 1024)
+            config.set("java_args.max_memory_mb", self._max_mem_spin.value() * 1024)
+            config.set("java_args.extra_args", self._jvm_args_edit.toPlainText())
+
+            config.set("game_directory", self._game_dir_edit.text())
+            config.set("launch.window_width", self._width_spin.value())
+            config.set("launch.window_height", self._height_spin.value())
+            config.set("launch.fullscreen", self._fullscreen_check.isChecked())
+            config.set("launch.close_launcher", self._close_launcher_check.isChecked())
+            config.set("demo_mode", self._demo_mode_check.isChecked())
+            config.set("download.source", self._source_combo.currentIndex())
+            config.set("download.max_threads", self._threads_spin.value())
+            config.set("download.speed_limit", self._speed_spin.value())
+            config.set("download.verify", self._verify_check.isChecked())
+
+            config.save()
+        except Exception as e:
+            logger.error("保存设置失败: %s", e, exc_info=True)
+
         settings = {
             "theme": new_theme.value,
             "accent_color": color_index,
-            "language": self._lang_combo.currentIndex(),
-            "autostart": self._autostart_check.isChecked(),
-            "minimize_to_tray": self._minimize_tray_check.isChecked(),
-            "check_update": self._check_update_check.isChecked(),
-            "java_path": self._java_path_edit.text(),
-            "min_memory": self._min_mem_spin.value(),
-            "max_memory": self._max_mem_spin.value(),
-            "jvm_args": self._jvm_args_edit.toPlainText(),
-            "game_dir": self._game_dir_edit.text(),
-            "window_width": self._width_spin.value(),
-            "window_height": self._height_spin.value(),
-            "fullscreen": self._fullscreen_check.isChecked(),
-            "close_after_launch": self._close_launcher_check.isChecked(),
-            "demo_mode": self._demo_mode_check.isChecked(),
-            "download_source": self._source_combo.currentIndex(),
-            "download_threads": self._threads_spin.value(),
-            "speed_limit": self._speed_spin.value(),
-            "verify_downloads": self._verify_check.isChecked(),
         }
 
         self.settings_changed.emit(settings)

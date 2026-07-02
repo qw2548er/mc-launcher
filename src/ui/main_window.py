@@ -165,6 +165,7 @@ class LaunchThread(QThread):
     def run(self):
         try:
             from src.core.launcher import GameLauncher, LaunchError
+            from src.core.java_detector import JavaDetector
             from src.core.account import AccountInfo
             import uuid
 
@@ -181,7 +182,20 @@ class LaunchThread(QThread):
                 username=self._username,
             )
 
-            java_path = Path(self._java_path) if self._java_path else None
+            java_path = None
+            if self._java_path:
+                java_path = Path(self._java_path)
+                self.launch_progress.emit(f"使用指定的 Java: {java_path}")
+            else:
+                self.launch_progress.emit("正在自动检测合适的 Java...")
+                detector = JavaDetector()
+                best_java = detector.get_best_match(self._version_id)
+                if best_java:
+                    java_path = best_java.path
+                    self.launch_progress.emit(f"自动选择 Java {best_java.major_version} ({best_java.vendor})")
+                else:
+                    required_ver = JavaDetector.get_required_java_version(self._version_id)
+                    raise LaunchError(f"未找到 Java {required_ver} 或更高版本。\n请安装 Java {required_ver} 后重试，或手动指定 Java 路径。")
 
             def on_log(line: str, level: str):
                 self.launch_log.emit(line, level)
@@ -259,6 +273,8 @@ class MainWindow(QMainWindow):
         self._launcher = None
         self._log_window: Optional[GameLogWindow] = None
         self._game_hide_launcher = True
+        self._java_detector = None
+        self._java_warning_widget: Optional[QFrame] = None
 
         self._setup_window()
         self._setup_ui()
@@ -295,12 +311,17 @@ class MainWindow(QMainWindow):
             from src.core.java_detector import JavaDetector
             from src.utils.config import get_config
             config = get_config()
-            detector = JavaDetector()
-            javas = detector.scan()
+            self._java_detector = JavaDetector()
+            javas = self._java_detector.scan()
             self._java_path_combo.clear()
-            self._java_path_combo.addItem(self.tr("自动检测"), "")
+            self._java_path_combo.addItem(self.tr("自动选择最合适的 Java"), "")
             for j in javas:
-                self._java_path_combo.addItem(f"Java {j.major_version} - {j.path}", str(j.path))
+                vendor = j.vendor.split(" ")[0] if j.vendor else ""
+                label = f"Java {j.major_version}"
+                if vendor and vendor != "Unknown":
+                    label += f" ({vendor})"
+                label += f" - {j.path}"
+                self._java_path_combo.addItem(label, str(j.path))
 
             saved_java = config.get("java_path", "")
             if saved_java:
@@ -324,9 +345,11 @@ class MainWindow(QMainWindow):
             saved_username = config.get("offline_username", "Steve")
             self.set_account_info(saved_username, is_microsoft=False)
 
-            if javas:
+            if self._selected_version:
+                self._check_java_compatibility()
+            elif javas:
                 best = javas[0]
-                self.set_java_status(best.version)
+                self.set_java_status(f"Java {best.major_version}")
             else:
                 self.set_java_status(self.tr("未检测到"))
 
@@ -973,6 +996,7 @@ class MainWindow(QMainWindow):
             self._selected_version = None
             self._version_display.setText(self.tr("请选择版本"))
             self._launch_btn.setEnabled(False)
+            self._hide_java_warning()
             return
         widget = self._version_list.itemWidget(current)
         if isinstance(widget, VersionListItem):
@@ -983,6 +1007,7 @@ class MainWindow(QMainWindow):
                           not self._is_game_running)
             self._launch_btn.setEnabled(can_launch)
             self.version_selected.emit(widget.version_id)
+            self._check_java_compatibility()
 
     def _refresh_versions(self) -> None:
         Toast.info(self.tr("正在刷新版本列表..."))
@@ -1130,6 +1155,111 @@ class MainWindow(QMainWindow):
             config.save()
         except Exception:
             pass
+        if self._selected_version:
+            self._check_java_compatibility()
+
+    def _check_java_compatibility(self) -> None:
+        if not self._selected_version or not self._java_detector:
+            self._hide_java_warning()
+            return
+
+        from src.core.java_detector import JavaDetector
+        required_ver = JavaDetector.get_required_java_version(self._selected_version)
+
+        java_path = self._java_path_combo.currentData()
+        if not java_path:
+            java_path = self._java_path_combo.currentText()
+
+        selected_java = None
+        if java_path and java_path != self.tr("自动选择最合适的 Java"):
+            from pathlib import Path
+            selected_java = self._java_detector.check_java(Path(java_path))
+        else:
+            selected_java = self._java_detector.get_best_match(self._selected_version)
+
+        if selected_java is None:
+            self._show_java_warning(
+                self.tr(f"⚠️ 未找到 Java {required_ver}"),
+                self.tr(f"Minecraft {self._selected_version} 需要 Java {required_ver} 或更高版本。"),
+                required_ver
+            )
+            self.set_java_status(self.tr(f"需要 Java {required_ver}"), warning=True)
+            return
+
+        is_compat, reason = self._java_detector.check_compatibility(selected_java, self._selected_version)
+        if not is_compat:
+            self._show_java_warning(
+                self.tr(f"⚠️ Java 版本不兼容"),
+                self.tr(f"当前选择的 Java {selected_java.major_version} 不满足要求。{reason}"),
+                required_ver
+            )
+            self.set_java_status(f"Java {selected_java.major_version}", warning=True)
+        else:
+            self._hide_java_warning()
+            self.set_java_status(f"Java {selected_java.major_version} ✓")
+
+    def _show_java_warning(self, title: str, message: str, required_version: int) -> None:
+        if self._java_warning_widget is not None:
+            self._hide_java_warning()
+
+        self._java_warning_widget = QFrame()
+        self._java_warning_widget.setStyleSheet("""
+            QFrame {
+                background: rgba(239, 68, 68, 0.15);
+                border: 1px solid rgba(239, 68, 68, 0.4);
+                border-radius: 8px;
+                padding: 12px;
+                margin: 0;
+            }
+        """)
+        warn_layout = QHBoxLayout(self._java_warning_widget)
+        warn_layout.setContentsMargins(12, 8, 12, 8)
+        warn_layout.setSpacing(12)
+
+        icon_label = QLabel("⚠️")
+        icon_label.setStyleSheet("font-size: 18px; border: none;")
+        warn_layout.addWidget(icon_label)
+
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color: #FCA5A5; font-weight: 700; font-size: 13px; border: none;")
+        text_layout.addWidget(title_label)
+        msg_label = QLabel(message)
+        msg_label.setStyleSheet("color: #D1D5DB; font-size: 12px; border: none;")
+        msg_label.setWordWrap(True)
+        text_layout.addWidget(msg_label)
+        warn_layout.addLayout(text_layout, 1)
+
+        download_btn = QPushButton(self.tr("下载 Java"))
+        download_btn.setObjectName("PrimaryButton")
+        download_btn.setFixedHeight(32)
+        download_btn.clicked.connect(lambda: self._open_java_download(required_version))
+        warn_layout.addWidget(download_btn)
+
+        main_content = self.findChild(QWidget, "MainContent")
+        if main_content:
+            layout = main_content.layout()
+            if layout:
+                launch_area = main_content.findChild(QWidget, "LaunchArea")
+                if launch_area:
+                    idx = layout.indexOf(launch_area)
+                    if idx >= 0:
+                        layout.insertWidget(idx, self._java_warning_widget)
+                        return
+                layout.addWidget(self._java_warning_widget)
+
+    def _hide_java_warning(self) -> None:
+        if self._java_warning_widget is not None:
+            self._java_warning_widget.hide()
+            self._java_warning_widget.deleteLater()
+            self._java_warning_widget = None
+
+    def _open_java_download(self, version: int) -> None:
+        import webbrowser
+        from src.core.java_detector import JavaDetector
+        url = JavaDetector.get_java_download_url(version)
+        webbrowser.open(url)
 
     def _on_game_dir_changed(self, text: str) -> None:
         try:
@@ -1175,11 +1305,16 @@ class MainWindow(QMainWindow):
         account_type = self.tr("正版登录") if is_microsoft else self.tr("离线模式")
         self._account_label.setText(f"{account_type} · {username}")
 
-    def set_java_status(self, version: str | None) -> None:
+    def set_java_status(self, version: str | None, warning: bool = False) -> None:
         if version:
             self._java_status.setText(self.tr("Java: ") + version)
+            if warning:
+                self._java_status.setStyleSheet("color: #EF4444; font-weight: 600;")
+            else:
+                self._java_status.setStyleSheet("")
         else:
             self._java_status.setText(self.tr("Java: 未检测"))
+            self._java_status.setStyleSheet("color: #F59E0B;")
 
     def set_memory_status(self, used: int, total: int) -> None:
         self._mem_status.setText(f"内存: {used}MB / {total}MB")

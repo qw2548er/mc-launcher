@@ -151,11 +151,15 @@ class TestJavaDetectorScan:
         detector._scanned = False
 
         mock_info = JavaInfo(Path("/usr/bin/java"), "17.0.10", 17)
-        with patch.object(detector, "_find_in_path", return_value=Path("/usr/bin/java")):
-            with patch.object(detector, "_parse_java_info", return_value=mock_info):
-                result = detector.scan()
-                assert len(result) >= 1
-                assert result[0].major_version == 17
+        with patch.object(detector, "_load_cache", return_value=None):
+            with patch.object(detector, "_save_cache", return_value=None):
+                with patch.object(detector, "_find_in_path", return_value=Path("/usr/bin/java")):
+                    with patch.object(detector, "_parse_java_info", return_value=mock_info):
+                        with patch.object(detector, "_scan_directory", return_value=[]):
+                            with patch.object(detector, "_scan_windows_registry", return_value=[]):
+                                result = detector.scan(force=True)
+                                assert len(result) >= 1
+                                assert result[0].major_version == 17
 
     def test_scan_returns_sorted(self):
         """测试扫描结果按版本降序排列。"""
