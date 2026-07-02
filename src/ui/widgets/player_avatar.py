@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +12,7 @@ from PyQt6.QtCore import pyqtSignal, Qt, QThread
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QBrush, QColor
 from PyQt6.QtWidgets import QWidget
 
-from src.core.account import AccountInfo, AccountManager
+from src.core.account import AccountInfo
 from src.core.skin_manager import get_skin_manager
 
 
@@ -37,6 +36,25 @@ class _AvatarLoaderThread(QThread):
             )
             if path:
                 self.avatar_loaded.emit(self._uuid, str(path))
+        except Exception:
+            pass
+
+
+class _SkinRefreshSignal(QThread):
+    skin_fetched = pyqtSignal(str, str)
+
+    def __init__(self, uuid_str: str, size: int, parent=None):
+        super().__init__(parent)
+        self._uuid = uuid_str
+        self._size = size
+
+    def run(self):
+        try:
+            mgr = get_skin_manager()
+            mgr.fetch_and_update_skin(self._uuid)
+            avatar_path = mgr.get_avatar_path(self._uuid, self._size)
+            if avatar_path.exists():
+                self.skin_fetched.emit(self._uuid, str(avatar_path))
         except Exception:
             pass
 
@@ -83,22 +101,14 @@ class PlayerAvatar(QWidget):
             self._refresh_skin_async(account.uuid)
 
     def _refresh_skin_async(self, uuid_str: str) -> None:
-        def _do_refresh():
-            try:
-                mgr = get_skin_manager()
-                mgr.fetch_and_update_skin(uuid_str)
-                avatar_path = mgr.get_avatar_path(uuid_str, self._size)
-                if avatar_path.exists():
-                    from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-                    QMetaObject.invokeMethod(
-                        self, "_set_avatar_from_path",
-                        Qt.ConnectionType.QueuedConnection,
-                        Q_ARG(str, str(avatar_path))
-                    )
-            except Exception:
-                pass
-        t = threading.Thread(target=_do_refresh, daemon=True)
-        t.start()
+        self._skin_refresh = _SkinRefreshSignal(uuid_str, self._size, self)
+        self._skin_refresh.skin_fetched.connect(self._on_skin_fetched)
+        self._skin_refresh.start()
+
+    def _on_skin_fetched(self, uuid_str: str, path_str: str) -> None:
+        if uuid_str != self._uuid:
+            return
+        self._set_pixmap_from_path(Path(path_str))
 
     def _on_avatar_loaded(self, uuid_str: str, path_str: str) -> None:
         if uuid_str != self._uuid:
@@ -116,10 +126,6 @@ class PlayerAvatar(QWidget):
             self._pixmap = scaled
         self._loading = False
         self.update()
-
-    @pyqtSlot(str)
-    def _set_avatar_from_path(self, path_str: str) -> None:
-        self._set_pixmap_from_path(Path(path_str))
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
