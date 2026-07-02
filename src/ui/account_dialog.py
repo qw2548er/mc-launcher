@@ -10,12 +10,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QLineEdit, QFrame, QSizePolicy,
-    QMessageBox, QInputDialog, QSize
+    QMessageBox, QInputDialog
 )
 
 from .widgets import DialogTitleBar, CardWidget, Toast, ToastType
