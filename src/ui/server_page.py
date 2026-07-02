@@ -263,7 +263,7 @@ class ServerPage(QWidget):
         layout.addLayout(header_row)
 
         list_card = CardWidget()
-        list_layout = QVBoxLayout(list_card.content_layout)
+        list_layout = list_card.content_layout
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(0)
 
