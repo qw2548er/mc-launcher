@@ -195,7 +195,7 @@ class MicrosoftLoginDialog(QDialog):
         if self._device_code:
             clipboard = self._get_clipboard()
             clipboard.setText(self._device_code.user_code)
-            Toast.success(self, self.tr("代码已复制到剪贴板"))
+            Toast.success(self.tr("代码已复制到剪贴板"))
 
     def _get_clipboard(self):
         from PyQt6.QtWidgets import QApplication

@@ -490,7 +490,7 @@ class MainWindow(QMainWindow):
         self._refresh_account_display()
         acc = self._account_manager.get_selected()
         if acc:
-            Toast.success(self, self.tr("已切换到: ") + acc.username)
+            Toast.success(self.tr("已切换到: ") + acc.username)
 
     def _add_account_from_menu(self):
         from .account_dialog import AccountDialog

@@ -249,7 +249,7 @@ class JavaManagerWidget(QWidget):
 
         is_compatible, reason = True, ""
         if self._mc_version:
-            is_compatible, reason = self._detector.is_compatible(java, self._mc_version)
+            is_compatible, reason = self._detector.check_compatibility(java, self._mc_version)
 
         version_label = QLabel(f"Java {java.major_version}")
         version_label.setFont(QFont("", 10, QFont.Weight.Bold))
@@ -301,7 +301,7 @@ class JavaManagerWidget(QWidget):
             self._compat_label.setText("")
             return
 
-        is_compatible, reason = self._detector.is_compatible(self._selected_java, self._mc_version)
+        is_compatible, reason = self._detector.check_compatibility(self._selected_java, self._mc_version)
         if is_compatible:
             self._compat_label.setText("✓ 与当前版本兼容")
             self._compat_label.setStyleSheet("color: #10B981; font-weight: 600;")
@@ -316,7 +316,7 @@ class JavaManagerWidget(QWidget):
 
         required_ver = JavaDetector.get_required_java_version(self._mc_version)
         has_compatible = any(
-            self._detector.is_compatible(j, self._mc_version)[0] for j in self._javas
+            self._detector.is_compatible(j, self._mc_version) for j in self._javas
         )
         self._no_java_hint.setVisible(not has_compatible)
 
@@ -335,7 +335,7 @@ class JavaManagerWidget(QWidget):
         java_path = Path(path)
         info = self._detector.add_custom_java(java_path)
         if info:
-            Toast.success(self, f"已添加 Java {info.major_version}")
+            Toast.success(f"已添加 Java {info.major_version}")
             self.refresh_list()
         else:
             QMessageBox.warning(
@@ -358,7 +358,7 @@ class JavaManagerWidget(QWidget):
 
         if reply == QMessageBox.StandardButton.Yes:
             self._detector.remove_java(self._selected_java.path)
-            Toast.success(self, "已移除")
+            Toast.success("已移除")
             self.refresh_list()
 
     def _set_as_default(self):
@@ -369,7 +369,7 @@ class JavaManagerWidget(QWidget):
         config = get_config()
         config.set("java_path", str(self._selected_java.path))
         config.save()
-        Toast.success(self, f"已设置 Java {self._selected_java.major_version} 为默认")
+        Toast.success(f"已设置 Java {self._selected_java.major_version} 为默认")
 
     def _download_java(self):
         required_ver = JavaDetector.get_required_java_version(self._mc_version) if self._mc_version else 17

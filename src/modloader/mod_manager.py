@@ -87,6 +87,7 @@ class ModManager:
         self._conflicts: list[ModConflict] = []
         self._icon_cache_dir = self._game_dir / "cache" / "mod_icons"
         ensure_directory(self._icon_cache_dir)
+        ensure_directory(self._mods_dir)
 
     @property
     def game_dir(self) -> Path:

@@ -311,6 +311,8 @@ def export_diagnostic_report(save_path: Optional[Path] = None,
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_path = log_dir / f"diagnostic_{ts}.txt"
+    else:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
     save_path.write_text(report, encoding="utf-8")
     logger.info("诊断报告已导出至: %s", save_path)

@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFont
 
 from .widgets import Toast, ToastType
-from src.core.java_detector import JavaDetector, JavaInstallation
+from src.core.java_detector import JavaDetector, JavaInfo
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ class FirstRunWizard(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._java_installations: list[JavaInstallation] = []
-        self._selected_java: Optional[JavaInstallation] = None
+        self._java_installations: list[JavaInfo] = []
+        self._selected_java: Optional[JavaInfo] = None
         self._game_dir: Path = Path.home() / ".minecraft"
         self._memory_mb: int = 4096
         self._setup_window()
@@ -294,14 +294,14 @@ class FirstRunWizard(QDialog):
     def _start_java_detection(self) -> None:
         try:
             detector = JavaDetector()
-            self._java_installations = detector.find_java_installations()
+            self._java_installations = detector.scan()
             self._java_progress.setRange(0, 1)
             self._java_progress.setValue(1)
 
             if self._java_installations:
                 self._java_status.setText(self.tr(f"检测到 {len(self._java_installations)} 个 Java 安装"))
                 for j in self._java_installations:
-                    ver = j.version_string or "未知版本"
+                    ver = j.version or "未知版本"
                     self._java_combo.addItem(f"Java {ver} ({j.path})", j)
                 self._selected_java = self._java_installations[0]
             else:
@@ -362,7 +362,12 @@ class FirstRunWizard(QDialog):
                     Toast.warning(self.tr("请选择或指定 Java 路径"))
                     return
             if java_path:
-                self._selected_java = JavaInstallation(path=Path(java_path))
+                check_detector = JavaDetector()
+                java_info = check_detector.check_java(Path(java_path))
+                if java_info:
+                    self._selected_java = java_info
+                else:
+                    self._selected_java = None
         elif idx == 2:
             dir_text = self._gamedir_edit.text().strip()
             if not dir_text:

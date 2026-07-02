@@ -280,7 +280,7 @@ class AccountDialog(QDialog):
             self._load_accounts()
             self._load_avatar_async(account)
             self.accounts_changed.emit()
-            Toast.success(self, self.tr("已添加离线账号: {0}").format(username))
+            Toast.success(self.tr("已添加离线账号: {0}").format(username))
 
             for i, acc in enumerate(self._accounts):
                 if acc.uuid == account.uuid:
@@ -310,7 +310,7 @@ class AccountDialog(QDialog):
         self._load_avatar_async(account)
         self.accounts_changed.emit()
         self.account_added.emit(account.uuid)
-        Toast.success(self, self.tr("登录成功: {0}").format(profile.username))
+        Toast.success(self.tr("登录成功: {0}").format(profile.username))
 
         for i, acc in enumerate(self._accounts):
             if acc.uuid == account.uuid:
@@ -433,18 +433,18 @@ class AccountDialog(QDialog):
             self._load_accounts()
             self.account_selected.emit(acc.uuid)
             self.accounts_changed.emit()
-            Toast.success(self, self.tr("已切换到: {0}").format(acc.username))
+            Toast.success(self.tr("已切换到: {0}").format(acc.username))
 
     def _refresh_account(self) -> None:
         acc = self._get_current_account()
         if not acc or not acc.is_microsoft:
             return
 
-        Toast.info(self, self.tr("正在刷新令牌..."))
+        Toast.info(self.tr("正在刷新令牌..."))
         valid = self._account_manager.ensure_valid_token(acc)
         if valid:
             self._load_accounts()
-            Toast.success(self, self.tr("令牌刷新成功"))
+            Toast.success(self.tr("令牌刷新成功"))
         else:
             QMessageBox.warning(
                 self, self.tr("刷新失败"),
@@ -467,7 +467,7 @@ class AccountDialog(QDialog):
             self._load_accounts()
             self.account_removed.emit(acc.uuid)
             self.accounts_changed.emit()
-            Toast.info(self, self.tr("已删除账号"))
+            Toast.info(self.tr("已删除账号"))
 
     def _get_current_account(self) -> Optional[AccountInfo]:
         item = self._account_list.currentItem()
