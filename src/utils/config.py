@@ -56,6 +56,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "time": "",
         "launch_count": 0,
     },
+    "auth": {
+        "ms_client_id": "",
+    },
 }
 
 

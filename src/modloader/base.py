@@ -17,10 +17,12 @@ from src.utils.http_utils import HttpClient, get_http_client
 logger = logging.getLogger(__name__)
 
 
-class ModLoaderType(Enum):
+class ModLoaderType(str, Enum):
     FORGE = "forge"
     FABRIC = "fabric"
     QUILT = "quilt"
+    NEOFORGE = "neoforge"
+    UNKNOWN = "unknown"
 
 
 @dataclass

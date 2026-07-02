@@ -1,7 +1,7 @@
 """Quilt 加载器模块。
 
 通过 Quilt Meta API 获取版本列表、安装 Quilt 加载器。
-Quilt 是 Fabric 的分支，兼容 Fabric 模组。
+Quilt 是 Fabric 的分支，兼容 Fabric 模组，使用类似的安装流程。
 """
 
 from __future__ import annotations
@@ -11,16 +11,18 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from src.utils.file_utils import ensure_directory, write_json, calculate_sha1
+from src.utils.file_utils import ensure_directory, write_json
 from src.utils.http_utils import HttpClient, HttpError, get_http_client
 
 from .base import (
     BaseModLoader, ModLoaderType, ModLoaderVersion, InstallResult, InstallProgress,
 )
+from .maven_utils import download_libraries
 
 logger = logging.getLogger(__name__)
 
 QUILT_META_URL = "https://meta.quiltmc.org"
+QUILT_MAVEN_URL = "https://maven.quiltmc.org/repository/release/"
 
 
 class QuiltLoader(BaseModLoader):
@@ -78,32 +80,29 @@ class QuiltLoader(BaseModLoader):
             )
 
             if isinstance(data, list):
+                beta_found = False
                 for i, entry in enumerate(data):
                     if isinstance(entry, dict):
-                        ver = entry.get("version", "")
+                        loader_info = entry.get("loader", {})
+                        ver = loader_info.get("version", "")
+                        build = loader_info.get("build", entry.get("build", {}))
+                        is_beta = "beta" in ver.lower()
+                        if not is_beta:
+                            beta_found = True
+                        is_recommended = (i == 0 and not is_beta) or (not beta_found and i == 0)
+                        is_latest = (i == 0)
                         results.append(ModLoaderVersion(
                             version=ver,
                             mc_version=mc_version,
                             loader_type=ModLoaderType.QUILT,
-                            is_recommended=(i == len(data) - 2) if len(data) > 1 else False,
-                            is_latest=(i == len(data) - 1),
+                            is_recommended=is_recommended,
+                            is_latest=is_latest,
                         ))
-            elif isinstance(data, dict):
-                loader_versions = data.get("loader", {}).get("versions", [])
-                for i, ver in enumerate(loader_versions):
-                    results.append(ModLoaderVersion(
-                        version=ver,
-                        mc_version=mc_version,
-                        loader_type=ModLoaderType.QUILT,
-                        is_recommended=(i == len(loader_versions) - 2) if len(loader_versions) > 1 else False,
-                        is_latest=(i == len(loader_versions) - 1),
-                    ))
-
         except Exception as e:
             logger.error("获取 Quilt 版本列表失败: %s", e)
-            raise HttpError(f"获取 Quilt 版本列表失败: {e}", url=f"{QUILT_META_URL}/v3/versions/loader/{mc_version}")
+            raise HttpError(f"获取 Quilt 版本列表失败: {e}",
+                            url=f"{QUILT_META_URL}/v3/versions/loader/{mc_version}")
 
-        results.sort(key=lambda v: (not v.is_recommended, not v.is_latest, v.version))
         return results
 
     def get_install_url(self, mc_version: str, loader_version: str) -> str:
@@ -116,40 +115,59 @@ class QuiltLoader(BaseModLoader):
         progress_callback: Optional[Callable[[InstallProgress], None]] = None,
     ) -> InstallResult:
         self.reset()
-        self._report_progress(progress_callback, "preparing", 0, "准备安装 Quilt...")
+
+        def _progress(stage: str, pct: float, msg: str, err: Optional[str] = None):
+            self._report_progress(progress_callback, stage, pct, msg, err)
 
         try:
             version_id = self._make_version_id(mc_version, loader_version.version)
             version_dir = self._versions_dir / version_id
             ensure_directory(version_dir)
-
             self._check_cancelled()
 
-            self._report_progress(progress_callback, "fetching_profile", 15,
-                                  "获取 Quilt 安装配置...")
+            _progress("preparing", 0, f"准备安装 Quilt {loader_version.version}...")
+
+            _progress("fetching_profile", 10, "获取 Quilt 安装配置...")
             profile_url = self.get_install_url(mc_version, loader_version.version)
             profile = self._http.get_json(profile_url)
             self._check_cancelled()
 
-            if isinstance(profile, dict) and "id" in profile:
-                profile["id"] = version_id
+            if not isinstance(profile, dict):
+                raise RuntimeError("Quilt Meta 返回无效的 profile 数据")
 
-            if isinstance(profile, dict) and "inheritsFrom" in profile:
-                profile["inheritsFrom"] = mc_version
+            profile["id"] = version_id
+            profile["inheritsFrom"] = mc_version
+            profile["type"] = "release"
 
-            self._report_progress(progress_callback, "saving_profile", 50,
-                                  "保存版本配置文件...")
+            if "mainClass" not in profile:
+                profile["mainClass"] = "org.quiltmc.loader.impl.launch.knot.KnotClient"
+
+            _progress("downloading_libraries", 20, "下载 Quilt 依赖库...")
+            libraries = profile.get("libraries", [])
+
+            extra_repos = [QUILT_MAVEN_URL, "https://maven.fabricmc.net/"]
+
+            def _lib_progress(cur: int, total: int, pct: float, fname: str):
+                overall = 20 + (pct / 100) * 70
+                _progress("downloading_libraries", overall, f"下载库文件: {cur}/{total} - {fname}")
+
+            success_count, failed_count = download_libraries(
+                libraries=libraries,
+                libraries_dir=self._libraries_dir,
+                http_client=self._http,
+                progress_callback=_lib_progress,
+                extra_repos=extra_repos,
+                cancel_check=lambda: self._cancel_flag,
+            )
+            logger.info("Quilt 库下载完成: 成功 %d, 失败 %d", success_count, failed_count)
+
+            self._check_cancelled()
+
+            _progress("saving_profile", 95, "保存版本配置文件...")
             version_json_path = version_dir / f"{version_id}.json"
             write_json(version_json_path, profile)
-            self._check_cancelled()
 
-            self._report_progress(progress_callback, "downloading_libraries", 60,
-                                  "下载 Quilt 库文件...")
-            lib_count = self._download_libraries(profile, progress_callback)
-            self._check_cancelled()
-
-            self._report_progress(progress_callback, "completed", 100,
-                                  f"Quilt {loader_version.version} 安装完成")
+            _progress("completed", 100, f"Quilt {loader_version.version} 安装完成")
             logger.info("Quilt 安装完成: %s -> %s", mc_version, version_id)
 
             return InstallResult(
@@ -164,66 +182,16 @@ class QuiltLoader(BaseModLoader):
         except (RuntimeError, HttpError, OSError) as e:
             error_msg = str(e)
             if "取消" in error_msg:
-                self._report_progress(progress_callback, "cancelled", 0, error=error_msg)
+                _progress("cancelled", 0, err=error_msg)
                 return InstallResult(
-                    success=False,
-                    loader_type=ModLoaderType.QUILT,
-                    mc_version=mc_version,
-                    loader_version=loader_version.version,
-                    new_version_id="",
-                    message=error_msg,
+                    success=False, loader_type=ModLoaderType.QUILT,
+                    mc_version=mc_version, loader_version=loader_version.version,
+                    new_version_id="", message=error_msg,
                 )
-            logger.error("Quilt 安装失败: %s", e)
-            self._report_progress(progress_callback, "failed", 0, error=error_msg)
+            logger.error("Quilt 安装失败: %s", e, exc_info=True)
+            _progress("failed", 0, err=f"安装失败: {error_msg}")
             return InstallResult(
-                success=False,
-                loader_type=ModLoaderType.QUILT,
-                mc_version=mc_version,
-                loader_version=loader_version.version,
-                new_version_id="",
-                message=f"安装失败: {error_msg}",
+                success=False, loader_type=ModLoaderType.QUILT,
+                mc_version=mc_version, loader_version=loader_version.version,
+                new_version_id="", message=f"安装失败: {error_msg}",
             )
-
-    def _download_libraries(
-        self,
-        version_json: dict,
-        progress_callback: Optional[Callable[[InstallProgress], None]],
-    ) -> int:
-        libraries = version_json.get("libraries", [])
-        if not libraries:
-            return 0
-
-        total = len(libraries)
-        for i, lib in enumerate(libraries):
-            self._check_cancelled()
-            name = lib.get("name", "unknown")
-            downloads = lib.get("downloads", {})
-            artifact = downloads.get("artifact", {})
-            url = artifact.get("url", "")
-            path_str = artifact.get("path", "")
-            sha1 = artifact.get("sha1", "")
-
-            if not url or not path_str:
-                continue
-
-            lib_path = self._libraries_dir / path_str
-            if lib_path.exists():
-                if sha1 and calculate_sha1(lib_path).lower() == sha1.lower():
-                    continue
-
-            try:
-                ensure_directory(lib_path.parent)
-                self._http.download_file(
-                    url=url,
-                    save_path=lib_path,
-                    expected_sha1=sha1 if sha1 else None,
-                    resume=True,
-                )
-            except HttpError as e:
-                logger.warning("下载库文件失败 (%s): %s", name, e)
-
-            percent = 60 + (i + 1) / max(total, 1) * 35
-            self._report_progress(progress_callback, "downloading_libraries", percent,
-                                  f"下载库文件: {i + 1}/{total}")
-
-        return total

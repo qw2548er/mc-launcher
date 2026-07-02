@@ -13,20 +13,14 @@ import zipfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import tomllib
 
 from src.utils.file_utils import ensure_directory, calculate_sha1
+from .base import ModLoaderType
 
 logger = logging.getLogger(__name__)
-
-
-class ModLoaderType(str, Enum):
-    FORGE = "forge"
-    FABRIC = "fabric"
-    QUILT = "quilt"
-    UNKNOWN = "unknown"
 
 
 class ModState(Enum):
@@ -82,10 +76,17 @@ class ModManager:
 
     DISABLED_SUFFIX = ".disabled"
 
-    def __init__(self, game_dir: Optional[Path] = None):
-        self._game_dir = game_dir or Path.home() / ".minecraft"
+    def __init__(self, game_dir: Optional[Path] = None, mods_dir: Optional[Path] = None):
+        if mods_dir is not None:
+            self._mods_dir = Path(mods_dir)
+            self._game_dir = self._mods_dir.parent
+        else:
+            self._game_dir = game_dir or Path.home() / ".minecraft"
+            self._mods_dir = self._game_dir / "mods"
         self._mods: list[ModInfo] = []
         self._conflicts: list[ModConflict] = []
+        self._icon_cache_dir = self._game_dir / "cache" / "mod_icons"
+        ensure_directory(self._icon_cache_dir)
 
     @property
     def game_dir(self) -> Path:
@@ -97,7 +98,7 @@ class ModManager:
 
     @property
     def mods_dir(self) -> Path:
-        return self._game_dir / "mods"
+        return self._mods_dir
 
     @property
     def config_dir(self) -> Path:
@@ -191,20 +192,24 @@ class ModManager:
             with zipfile.ZipFile(mod_info.file_path, "r") as zf:
                 namelist = zf.namelist()
 
+                icon_path: Optional[str] = None
+
                 if "fabric.mod.json" in namelist:
-                    self._parse_fabric_metadata(mod_info, zf)
+                    icon_path = self._parse_fabric_metadata(mod_info, zf)
                 elif "quilt.mod.json" in namelist:
-                    self._parse_quilt_metadata(mod_info, zf)
+                    icon_path = self._parse_quilt_metadata(mod_info, zf)
                 elif "META-INF/mods.toml" in namelist:
-                    self._parse_forge_metadata(mod_info, zf)
+                    icon_path = self._parse_forge_metadata(mod_info, zf)
                 elif "mcmod.info" in namelist:
-                    self._parse_mcmod_info(mod_info, zf)
+                    icon_path = self._parse_mcmod_info(mod_info, zf)
                 else:
                     self._parse_universal_metadata(mod_info, zf)
+
+                self._extract_mod_icon(mod_info, zf, icon_path)
         except (zipfile.BadZipFile, OSError) as e:
             logger.warning("无法打开模组文件 %s: %s", mod_info.filename, e)
 
-    def _parse_fabric_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> None:
+    def _parse_fabric_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> Optional[str]:
         try:
             data = json.loads(zf.read("fabric.mod.json"))
             mod_info.loader_type = ModLoaderType.FABRIC
@@ -216,15 +221,29 @@ class ModManager:
 
             if "depends" in data:
                 mod_info.dependencies = data["depends"]
+
+            icon = data.get("icon", "")
+            if isinstance(icon, str) and icon:
+                return icon
+            if isinstance(icon, dict):
+                for size in ("64", "32", "128", "256"):
+                    if size in icon:
+                        return icon[size]
+                if icon:
+                    return next(iter(icon.values()))
+            return None
         except (json.JSONDecodeError, KeyError) as e:
             logger.debug("解析 fabric.mod.json 失败: %s", e)
+            return None
 
-    def _parse_quilt_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> None:
+    def _parse_quilt_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> Optional[str]:
         try:
             fabric_data = None
+            icon_path: Optional[str] = None
             if "fabric.mod.json" in zf.namelist():
                 try:
                     fabric_data = json.loads(zf.read("fabric.mod.json"))
+                    icon_path = fabric_data.get("icon")
                 except Exception:
                     pass
 
@@ -241,21 +260,31 @@ class ModManager:
                 mod_info.description = fabric_data.get("description", mod_info.description)
                 if "depends" in fabric_data:
                     mod_info.dependencies = fabric_data["depends"]
+                if not icon_path:
+                    icon_path = fabric_data.get("icon")
 
-            authors = quilt_loader.get("metadata", {}).get("contributors", {})
+            qmeta = quilt_loader.get("metadata", {})
+            qicon = qmeta.get("icon", "")
+            if qicon:
+                icon_path = qicon
+
+            authors = qmeta.get("contributors", {})
             if isinstance(authors, dict):
                 mod_info.author = ", ".join(authors.keys())
             elif isinstance(authors, list):
                 mod_info.author = ", ".join(authors)
 
+            return icon_path if isinstance(icon_path, str) else None
         except (json.JSONDecodeError, KeyError) as e:
             logger.debug("解析 quilt.mod.json 失败: %s", e)
+            return None
 
-    def _parse_forge_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> None:
+    def _parse_forge_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> Optional[str]:
         try:
             content = zf.read("META-INF/mods.toml").decode("utf-8")
             data = tomllib.loads(content)
             mod_info.loader_type = ModLoaderType.FORGE
+            logo_file: Optional[str] = None
 
             mods_list = data.get("mods", [])
             if mods_list:
@@ -265,16 +294,19 @@ class ModManager:
                 mod_info.version = mod.get("version", "")
                 mod_info.description = mod.get("description", "")
                 mod_info.author = mod.get("authors", "")
+                logo_file = mod.get("logoFile", "")
 
             dependencies = data.get("dependencies", {})
             for dep_id, dep_info in dependencies.items():
                 if isinstance(dep_info, dict):
                     mod_info.dependencies[dep_id] = dep_info.get("versionRange", "*")
 
+            return logo_file or None
         except (tomllib.TOMLDecodeError, KeyError, UnicodeDecodeError) as e:
             logger.debug("解析 mods.toml 失败: %s", e)
+            return None
 
-    def _parse_mcmod_info(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> None:
+    def _parse_mcmod_info(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> Optional[str]:
         try:
             data = json.loads(zf.read("mcmod.info"))
             mod_info.loader_type = ModLoaderType.FORGE
@@ -284,7 +316,7 @@ class ModManager:
             elif isinstance(data, dict):
                 entry = data
             else:
-                return
+                return None
 
             mod_info.mod_id = entry.get("modid", "")
             mod_info.name = entry.get("name", mod_info.name)
@@ -296,8 +328,11 @@ class ModManager:
             elif isinstance(authors, str):
                 mod_info.author = authors
 
+            logo = entry.get("logoFile", "")
+            return logo or None
         except (json.JSONDecodeError, KeyError) as e:
             logger.debug("解析 mcmod.info 失败: %s", e)
+            return None
 
     def _parse_universal_metadata(self, mod_info: ModInfo, zf: zipfile.ZipFile) -> None:
         """通用元数据解析，通过文件名和 MANIFEST.MF 推断。"""
@@ -320,6 +355,69 @@ class ModManager:
             except Exception:
                 pass
 
+    def _extract_mod_icon(self, mod_info: ModInfo, zf: zipfile.ZipFile, declared_icon: Optional[str]) -> None:
+        """从 jar 中提取模组图标到缓存目录。"""
+        import hashlib
+
+        if not mod_info.mod_id and not mod_info.name:
+            return
+
+        cache_key = mod_info.sha1 or mod_info.filename
+        if not cache_key:
+            return
+        icon_hash = hashlib.md5(cache_key.encode("utf-8")).hexdigest()[:16]
+        cached_icon = self._icon_cache_dir / f"{icon_hash}.png"
+
+        if cached_icon.exists():
+            mod_info.icon_path = str(cached_icon)
+            return
+
+        icon_candidates: list[str] = []
+
+        if declared_icon:
+            declared_icon = declared_icon.lstrip("/")
+            icon_candidates.append(declared_icon)
+            if "/" not in declared_icon:
+                icon_candidates.append(f"assets/{mod_info.mod_id}/{declared_icon}")
+
+        for pattern in [
+            f"assets/{mod_info.mod_id}/icon.png",
+            "pack.png",
+            "icon.png",
+            "logo.png",
+        ]:
+            if pattern not in icon_candidates:
+                icon_candidates.append(pattern)
+
+        namelist_set = set(zf.namelist())
+        for candidate in icon_candidates:
+            if candidate in namelist_set:
+                try:
+                    data = zf.read(candidate)
+                    if len(data) > 0 and data[:8] in (
+                        b"\x89PNG\r\n\x1a\n",
+                        b"\xff\xd8\xff",
+                    ):
+                        with open(cached_icon, "wb") as f:
+                            f.write(data)
+                        mod_info.icon_path = str(cached_icon)
+                        return
+                except Exception as e:
+                    logger.debug("提取图标失败 (%s): %s", candidate, e)
+
+        for name in zf.namelist():
+            lower = name.lower()
+            if lower.endswith(".png") and ("icon" in lower or "logo" in lower):
+                try:
+                    data = zf.read(name)
+                    if len(data) > 0 and data[:8] == b"\x89PNG\r\n\x1a\n":
+                        with open(cached_icon, "wb") as f:
+                            f.write(data)
+                        mod_info.icon_path = str(cached_icon)
+                        return
+                except Exception:
+                    continue
+
     @staticmethod
     def _extract_author(data: dict) -> str:
         authors = data.get("authors", [])
@@ -336,16 +434,21 @@ class ModManager:
         author = data.get("author", "")
         return author if isinstance(author, str) else ""
 
-    def enable_mod(self, mod_id: str) -> bool:
+    def _resolve_mod(self, mod_or_id: Union[str, ModInfo]) -> Optional[ModInfo]:
+        if isinstance(mod_or_id, ModInfo):
+            return mod_or_id
+        return self.get_mod_by_id(mod_or_id)
+
+    def enable_mod(self, mod_or_id: Union[str, ModInfo]) -> bool:
         """启用模组（移除 .disabled 后缀）。
 
         Args:
-            mod_id: 模组 ID
+            mod_or_id: 模组 ID 字符串或 ModInfo 对象
 
         Returns:
             True 表示成功
         """
-        mod = self.get_mod_by_id(mod_id)
+        mod = self._resolve_mod(mod_or_id)
         if mod is None or not mod.is_disabled:
             return False
 
@@ -361,16 +464,16 @@ class ModManager:
             logger.error("启用模组失败 (%s): %s", mod.name, e)
             return False
 
-    def disable_mod(self, mod_id: str) -> bool:
+    def disable_mod(self, mod_or_id: Union[str, ModInfo]) -> bool:
         """禁用模组（添加 .disabled 后缀）。
 
         Args:
-            mod_id: 模组 ID
+            mod_or_id: 模组 ID 字符串或 ModInfo 对象
 
         Returns:
             True 表示成功
         """
-        mod = self.get_mod_by_id(mod_id)
+        mod = self._resolve_mod(mod_or_id)
         if mod is None or not mod.is_enabled:
             return False
 
@@ -386,22 +489,23 @@ class ModManager:
             logger.error("禁用模组失败 (%s): %s", mod.name, e)
             return False
 
-    def delete_mod(self, mod_id: str) -> bool:
+    def delete_mod(self, mod_or_id: Union[str, ModInfo]) -> bool:
         """删除模组文件。
 
         Args:
-            mod_id: 模组 ID
+            mod_or_id: 模组 ID 字符串或 ModInfo 对象
 
         Returns:
             True 表示成功
         """
-        mod = self.get_mod_by_id(mod_id)
+        mod = self._resolve_mod(mod_or_id)
         if mod is None:
             return False
 
         try:
             mod.file_path.unlink()
-            self._mods.remove(mod)
+            if mod in self._mods:
+                self._mods.remove(mod)
             logger.info("删除模组: %s", mod.name)
             return True
         except OSError as e:

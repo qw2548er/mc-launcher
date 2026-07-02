@@ -16,6 +16,7 @@ from urllib3.util.retry import Retry
 
 from src.utils.file_utils import calculate_sha1, ensure_directory, format_file_size
 from src.utils.logger import get_logger
+from src.utils.download_source import get_download_source_manager
 
 logger = get_logger(__name__)
 
@@ -233,9 +234,10 @@ class HttpClient:
 
     def get(self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None, **kwargs) -> requests.Response:
         """发送 GET 请求。"""
+        rewritten_url = self._rewrite_url(url)
         try:
             resp = self.session.get(
-                url,
+                rewritten_url,
                 params=params,
                 headers=headers,
                 timeout=self.timeout,
@@ -247,7 +249,7 @@ class HttpClient:
             raise HttpError(
                 f"GET 请求失败: {e}",
                 status_code=getattr(e.response, "status_code", 0) if e.response else 0,
-                url=url,
+                url=rewritten_url,
                 original_error=e,
             )
 
@@ -262,9 +264,10 @@ class HttpClient:
     def post(self, url: str, data: Any = None, json_data: Any = None,
              headers: Optional[dict] = None, **kwargs) -> requests.Response:
         """发送 POST 请求。"""
+        rewritten_url = self._rewrite_url(url)
         try:
             resp = self.session.post(
-                url,
+                rewritten_url,
                 data=data,
                 json=json_data,
                 headers=headers,
@@ -277,21 +280,22 @@ class HttpClient:
             raise HttpError(
                 f"POST 请求失败: {e}",
                 status_code=getattr(e.response, "status_code", 0) if e.response else 0,
-                url=url,
+                url=rewritten_url,
                 original_error=e,
             )
 
     def head(self, url: str, headers: Optional[dict] = None) -> requests.Response:
         """发送 HEAD 请求获取文件信息。"""
+        rewritten_url = self._rewrite_url(url)
         try:
-            resp = self.session.head(url, headers=headers, timeout=self.timeout, allow_redirects=True)
+            resp = self.session.head(rewritten_url, headers=headers, timeout=self.timeout, allow_redirects=True)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
             raise HttpError(
                 f"HEAD 请求失败: {e}",
                 status_code=getattr(e.response, "status_code", 0) if e.response else 0,
-                url=url,
+                url=rewritten_url,
                 original_error=e,
             )
 
@@ -385,6 +389,7 @@ class HttpClient:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> bool:
         """单次下载尝试的内部实现。"""
+        rewritten_url = self._rewrite_url(url)
         downloaded = 0
         mode = "wb"
         headers: dict[str, str] = {}
@@ -407,7 +412,7 @@ class HttpClient:
             mode = "ab"
 
         resp = self.session.get(
-            url,
+            rewritten_url,
             headers=headers,
             stream=True,
             timeout=self.timeout,
@@ -423,7 +428,7 @@ class HttpClient:
                         return True
             temp_path.unlink(missing_ok=True)
             return self._download_file_internal(
-                url, save_path, temp_path, progress_callback,
+                rewritten_url, save_path, temp_path, progress_callback,
                 expected_size, expected_sha1, resume=False, chunk_size=chunk_size,
             )
 
@@ -520,6 +525,15 @@ class HttpClient:
 
         logger.debug("下载完成: %s (%d bytes)", save_path.name, downloaded)
         return True
+
+    def _rewrite_url(self, url: str) -> str:
+        if not url:
+            return url
+        try:
+            manager = get_download_source_manager()
+            return manager.rewrite_url(url)
+        except Exception:
+            return url
 
     def close(self) -> None:
         """关闭 Session。"""

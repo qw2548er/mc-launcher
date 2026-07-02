@@ -126,6 +126,7 @@ class TestAccountManager:
     def test_add_microsoft_account(self, manager):
         """测试添加正版账号。"""
         acc = manager.add_microsoft_account(
+            account_uuid="ms-uuid-001",
             username="Steve",
             access_token="acc_token",
             refresh_token="ref_token",
@@ -137,9 +138,9 @@ class TestAccountManager:
         assert acc.refresh_token == "ref_token"
 
     def test_add_microsoft_replaces_old(self, manager):
-        """测试添加正版账号会替换同名旧账号。"""
-        manager.add_microsoft_account("Steve", "token1", "refresh1")
-        manager.add_microsoft_account("Steve", "token2", "refresh2")
+        """测试添加正版账号会替换同 UUID 旧账号。"""
+        manager.add_microsoft_account("ms-uuid-steve", "Steve", "token1", "refresh1")
+        manager.add_microsoft_account("ms-uuid-steve", "Steve", "token2", "refresh2")
         all_accounts = manager.get_all()
         steve_accounts = [a for a in all_accounts if a.username == "Steve"]
         assert len(steve_accounts) == 1
@@ -197,7 +198,7 @@ class TestAccountManager:
 
     def test_update_token(self, manager):
         """测试刷新 token。"""
-        acc = manager.add_microsoft_account("Steve", "old_token", "old_refresh")
+        acc = manager.add_microsoft_account("ms-uuid-steve", "Steve", "old_token", "old_refresh")
         assert manager.update_token(acc.uuid, "new_token", "new_refresh", 7200)
         updated = manager.get_by_uuid(acc.uuid)
         assert updated.access_token == "new_token"
@@ -210,7 +211,7 @@ class TestAccountManager:
     def test_save_and_load(self, manager):
         """测试保存和加载账号。"""
         acc1 = manager.add_offline_account("Player1")
-        acc2 = manager.add_microsoft_account("Steve", "acc_token", "ref_token")
+        acc2 = manager.add_microsoft_account("ms-uuid-steve", "Steve", "acc_token", "ref_token")
         manager.save()
 
         # 新实例加载

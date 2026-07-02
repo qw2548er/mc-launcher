@@ -146,6 +146,9 @@ class LaunchThread(QThread):
         game_dir: str,
         max_memory_gb: int,
         extra_jvm_args: str = "",
+        account=None,
+        server_address: str = "",
+        server_port: int = 0,
     ):
         super().__init__()
         self._version_id = version_id
@@ -154,6 +157,9 @@ class LaunchThread(QThread):
         self._game_dir = Path(game_dir)
         self._max_memory_gb = max_memory_gb
         self._extra_jvm_args = extra_jvm_args
+        self._account = account
+        self._server_address = server_address
+        self._server_port = server_port
         self._launcher = None
         self._cancel = False
 
@@ -166,8 +172,6 @@ class LaunchThread(QThread):
         try:
             from src.core.launcher import GameLauncher, LaunchError
             from src.core.java_detector import JavaDetector
-            from src.core.account import AccountInfo
-            import uuid
 
             self.launch_started.emit()
             self.launch_progress.emit("正在初始化启动器...")
@@ -175,12 +179,16 @@ class LaunchThread(QThread):
             launcher = GameLauncher()
             self._launcher = launcher
 
-            account_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, f"offline:{self._username}"))
-            account = AccountInfo(
-                uuid=account_uuid,
-                type="offline",
-                username=self._username,
-            )
+            account = self._account
+            if account is None:
+                from src.core.account import AccountInfo
+                import uuid as uuid_mod
+                account_uuid = str(uuid_mod.uuid3(uuid_mod.NAMESPACE_DNS, f"offline:{self._username}"))
+                account = AccountInfo(
+                    uuid=account_uuid,
+                    type="offline",
+                    username=self._username,
+                )
 
             java_path = None
             if self._java_path:
@@ -239,6 +247,8 @@ class LaunchThread(QThread):
                 on_exit=on_exit,
                 on_progress=on_progress,
                 extra_jvm_args=self._extra_jvm_args if self._extra_jvm_args else None,
+                server_address=self._server_address if self._server_address else None,
+                server_port=self._server_port if self._server_port else None,
             )
 
             self.launch_finished.emit(True, "")
@@ -262,9 +272,11 @@ class MainWindow(QMainWindow):
         self._is_game_running = False
         self._drag_position = None
         self._version_manager = None
+        self._modloader_manager = None
         self._version_items: dict[str, VersionListItem] = {}
         self._all_versions: list[dict] = []
         self._installed_ids: set[str] = set()
+        self._installed_loaders: dict[str, str] = {}
         self._latest_release: str = ""
         self._latest_snapshot: str = ""
         self._download_thread: Optional[DownloadThread] = None
@@ -275,6 +287,8 @@ class MainWindow(QMainWindow):
         self._game_hide_launcher = True
         self._java_detector = None
         self._java_warning_widget: Optional[QFrame] = None
+        self._account_manager = None
+        self._game_dir: Optional[Path] = None
 
         self._setup_window()
         self._setup_ui()
@@ -282,6 +296,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         QTimer.singleShot(100, self._init_version_manager)
+        QTimer.singleShot(200, self._init_account_manager)
 
     def _setup_window(self) -> None:
         self.setWindowTitle(self.tr("Minecraft Launcher"))
@@ -297,9 +312,11 @@ class MainWindow(QMainWindow):
         try:
             from src.version.version_manager import VersionManager
             from src.utils.config import get_config
+            from src.modloader import ModLoaderManager
             config = get_config()
-            game_dir = Path(config.get("game_directory", str(Path.home() / ".minecraft")))
-            self._version_manager = VersionManager(game_dir=game_dir)
+            self._game_dir = Path(config.get("game_directory", str(Path.home() / ".minecraft")))
+            self._version_manager = VersionManager(game_dir=self._game_dir)
+            self._modloader_manager = ModLoaderManager(game_dir=self._game_dir)
             self._load_versions(force_refresh=False)
             self._init_launcher()
         except Exception as e:
@@ -343,7 +360,7 @@ class MainWindow(QMainWindow):
             self._memory_value.setText(f"{max_mem_gb} GB")
 
             saved_username = config.get("offline_username", "Steve")
-            self.set_account_info(saved_username, is_microsoft=False)
+            saved_java = config.get("java_path", "")
 
             if self._selected_version:
                 self._check_java_compatibility()
@@ -355,6 +372,133 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             logger.error("初始化 Java 检测器失败: %s", e, exc_info=True)
+
+    def _init_account_manager(self):
+        try:
+            from src.core.account import AccountManager
+            from src.core.skin_manager import get_skin_manager
+
+            self._account_manager = AccountManager()
+            self._account_manager.load()
+
+            accounts = self._account_manager.get_all()
+            if not accounts:
+                from src.utils.config import get_config
+                config = get_config()
+                default_name = config.get("offline_username", "Steve")
+                try:
+                    self._account_manager.add_offline_account(default_name)
+                except ValueError:
+                    self._account_manager.add_offline_account("Steve")
+
+            self._refresh_account_display()
+        except Exception as e:
+            logger.error("初始化账号管理器失败: %s", e, exc_info=True)
+
+    def _refresh_account_display(self):
+        if not self._account_manager:
+            return
+
+        selected = self._account_manager.get_selected()
+        if not selected:
+            self._welcome_label.setText(self.tr("欢迎回来，玩家！"))
+            self._account_label.setText(self.tr("未登录"))
+            self._change_name_btn.setText(self.tr("添加账号"))
+            self._title_bar.update_accounts([], "")
+            self._title_bar.set_account(None)
+            return
+
+        self._welcome_label.setText(self.tr("欢迎回来，") + selected.username + "！")
+        type_text = self.tr("正版登录") if selected.is_microsoft else self.tr("离线模式")
+        self._account_label.setText(f"{type_text} · {selected.username}")
+
+        if selected.is_microsoft:
+            valid = self._account_manager.ensure_valid_token(selected)
+            if valid is None and selected.is_token_expired:
+                self._account_label.setStyleSheet("color: #EF4444; font-size: 13px;")
+            else:
+                self._account_label.setStyleSheet("color: #9CA3AF; font-size: 13px;")
+        else:
+            self._account_label.setStyleSheet("color: #9CA3AF; font-size: 13px;")
+
+        self._change_name_btn.setText(self.tr("切换账号") if self._account_manager.get_count() > 1 else self.tr("管理账号"))
+
+        accounts_data = []
+        for acc in self._account_manager.get_all():
+            accounts_data.append({
+                "uuid": acc.uuid,
+                "username": acc.username,
+                "type": acc.type,
+            })
+        self._title_bar.update_accounts(accounts_data, selected.uuid)
+        self._title_bar.set_account(selected)
+
+        self._load_account_avatar(selected)
+
+    def _load_account_avatar(self, account):
+        try:
+            from src.core.skin_manager import get_skin_manager
+            from PyQt6.QtCore import QThread, pyqtSignal as Signal
+
+            class _AvatarThread(QThread):
+                loaded = Signal(str, str)
+                def __init__(self, uuid_str, username, skin_url, size):
+                    super().__init__()
+                    self.uuid = uuid_str
+                    self.username = username
+                    self.skin_url = skin_url
+                    self.size = size
+                def run(self):
+                    try:
+                        mgr = get_skin_manager()
+                        p = mgr.get_avatar(self.uuid, self.username, self.skin_url, size=self.size, download=True)
+                        if p:
+                            self.loaded.emit(self.uuid, str(p))
+                    except Exception:
+                        pass
+
+            def on_avatar(uuid_str, path):
+                try:
+                    from PyQt6.QtGui import QPixmap
+                    pm = QPixmap(path)
+                    if not pm.isNull():
+                        scaled = pm.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.FastTransformation)
+                        self._avatar_label.setPixmap(scaled)
+                        self._avatar_label.setText("")
+                        self._avatar_label.setStyleSheet("border-radius: 24px;")
+                except Exception:
+                    pass
+
+            mgr = get_skin_manager()
+            cached = mgr.get_avatar_path(account.uuid, 64)
+            if cached.exists() and cached.stat().st_size > 0:
+                on_avatar(account.uuid, str(cached))
+                return
+
+            self._avatar_label.setText("⏳")
+            t = _AvatarThread(account.uuid, account.username, account.skin_url, 64)
+            t.loaded.connect(on_avatar)
+            t.start()
+            self._avatar_thread = t
+        except Exception as e:
+            logger.debug("加载头像失败: %s", e)
+
+    def _switch_account_from_menu(self, account_uuid: str):
+        if not self._account_manager:
+            return
+        self._account_manager.switch_account(account_uuid)
+        self._refresh_account_display()
+        from .widgets import Toast
+        acc = self._account_manager.get_selected()
+        if acc:
+            Toast.success(self, self.tr("已切换到: ") + acc.username)
+
+    def _add_account_from_menu(self):
+        from .account_dialog import AccountDialog
+        dialog = AccountDialog(self)
+        dialog.accounts_changed.connect(self._refresh_account_display)
+        dialog.exec()
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -372,7 +516,7 @@ class MainWindow(QMainWindow):
         content.setContentsMargins(0, 0, 0, 0)
         content.setSpacing(0)
 
-        self._setup_version_list(content)
+        self._setup_left_panel(content)
         self._setup_main_content(content)
         root_layout.addLayout(content, 1)
 
@@ -385,7 +529,7 @@ class MainWindow(QMainWindow):
         self._title_bar.account_clicked.connect(self._open_accounts)
         self._title_bar.downloads_clicked.connect(self._open_downloads)
 
-    def _setup_version_list(self, parent_layout: QHBoxLayout) -> None:
+    def _setup_left_panel(self, parent_layout: QHBoxLayout) -> None:
         left_panel = QWidget()
         left_panel.setFixedWidth(300)
         left_panel.setObjectName("LeftPanel")
@@ -393,13 +537,38 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
+        tab_bar = QWidget()
+        tab_bar.setFixedHeight(52)
+        tab_bar.setObjectName("NavTabBar")
+        tab_bar_layout = QHBoxLayout(tab_bar)
+        tab_bar_layout.setContentsMargins(12, 8, 12, 0)
+        tab_bar_layout.setSpacing(4)
+
+        self._nav_versions_btn = self._create_nav_btn(self.tr("版本"), True)
+        self._nav_versions_btn.clicked.connect(lambda: self._switch_page(0))
+        tab_bar_layout.addWidget(self._nav_versions_btn)
+
+        self._nav_servers_btn = self._create_nav_btn(self.tr("多人"), False)
+        self._nav_servers_btn.clicked.connect(lambda: self._switch_page(1))
+        tab_bar_layout.addWidget(self._nav_servers_btn)
+
+        left_layout.addWidget(tab_bar)
+
+        self._left_stack = QStackedWidget()
+        left_layout.addWidget(self._left_stack, 1)
+
+        versions_page = QWidget()
+        vp_layout = QVBoxLayout(versions_page)
+        vp_layout.setContentsMargins(0, 0, 0, 0)
+        vp_layout.setSpacing(0)
+
         header = QWidget()
-        header.setFixedHeight(60)
+        header.setFixedHeight(52)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(16, 0, 16, 0)
 
         title = QLabel(self.tr("版本列表"))
-        title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        title.setStyleSheet("font-size: 14px; font-weight: 700;")
         header_layout.addWidget(title)
 
         header_layout.addStretch()
@@ -410,14 +579,14 @@ class MainWindow(QMainWindow):
         self._refresh_btn.setToolTip(self.tr("刷新版本列表"))
         header_layout.addWidget(self._refresh_btn)
 
-        left_layout.addWidget(header)
+        vp_layout.addWidget(header)
 
         self._version_list = QListWidget()
         self._version_list.setObjectName("VersionList")
         self._version_list.setSpacing(2)
         self._version_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._version_list.setFrameShape(QFrame.Shape.NoFrame)
-        left_layout.addWidget(self._version_list, 1)
+        vp_layout.addWidget(self._version_list, 1)
 
         filter_row = QWidget()
         filter_row.setFixedHeight(50)
@@ -435,7 +604,22 @@ class MainWindow(QMainWindow):
         self._filter_combo.setCurrentIndex(0)
         filter_layout.addWidget(self._filter_combo)
 
-        left_layout.addWidget(filter_row)
+        vp_layout.addWidget(filter_row)
+
+        self._left_stack.addWidget(versions_page)
+
+        servers_sidebar = QWidget()
+        ss_layout = QVBoxLayout(servers_sidebar)
+        ss_layout.setContentsMargins(12, 8, 12, 12)
+        ss_layout.setSpacing(8)
+
+        ss_hint = QLabel(self.tr("点击右侧「多人游戏」标签管理服务器列表"))
+        ss_hint.setWordWrap(True)
+        ss_hint.setStyleSheet("color: #6B7280; font-size: 12px; padding: 8px;")
+        ss_layout.addWidget(ss_hint)
+        ss_layout.addStretch()
+
+        self._left_stack.addWidget(servers_sidebar)
 
         parent_layout.addWidget(left_panel)
 
@@ -444,11 +628,50 @@ class MainWindow(QMainWindow):
         separator.setFixedWidth(1)
         parent_layout.addWidget(separator)
 
+    def _create_nav_btn(self, text: str, active: bool) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCheckable(True)
+        btn.setChecked(active)
+        btn.setFixedHeight(36)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setProperty("nav_active", active)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                color: #9CA3AF;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 12px;
+            }
+            QPushButton:hover {
+                background: rgba(55, 65, 81, 0.5);
+                color: #D1D5DB;
+            }
+            QPushButton:checked {
+                background: rgba(124, 58, 237, 0.2);
+                color: #A855F7;
+            }
+        """)
+        return btn
+
+    def _switch_page(self, index: int) -> None:
+        self._nav_versions_btn.setChecked(index == 0)
+        self._nav_servers_btn.setChecked(index == 1)
+        self._left_stack.setCurrentIndex(index)
+        self._right_stack.setCurrentIndex(index)
+
+        if index == 1 and hasattr(self, '_server_page') and self._server_page:
+            QTimer.singleShot(100, self._server_page._refresh_all)
+
     def _setup_main_content(self, parent_layout: QHBoxLayout) -> None:
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(40, 30, 40, 20)
-        right_layout.setSpacing(20)
+        self._right_stack = QStackedWidget()
+
+        home_page = QWidget()
+        home_layout = QVBoxLayout(home_page)
+        home_layout.setContentsMargins(40, 30, 40, 20)
+        home_layout.setSpacing(20)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -466,9 +689,16 @@ class MainWindow(QMainWindow):
         scroll_layout.addStretch()
 
         scroll.setWidget(scroll_content)
-        right_layout.addWidget(scroll, 1)
+        home_layout.addWidget(scroll, 1)
 
-        parent_layout.addWidget(right_panel, 1)
+        self._right_stack.addWidget(home_page)
+
+        from .server_page import ServerPage
+        self._server_page = ServerPage(self)
+        self._server_page.join_server_requested.connect(self._join_server_direct)
+        self._right_stack.addWidget(self._server_page)
+
+        parent_layout.addWidget(self._right_stack, 1)
 
     def _setup_welcome_section(self, parent_layout: QVBoxLayout) -> None:
         welcome_card = CardWidget()
@@ -676,6 +906,12 @@ class MainWindow(QMainWindow):
         self._java_path_combo.editTextChanged.connect(self._on_java_path_changed)
         self._game_dir_combo.editTextChanged.connect(self._on_game_dir_changed)
 
+        self._title_bar.switch_account_requested.connect(self._switch_account_from_menu)
+        self._title_bar.add_account_requested.connect(self._add_account_from_menu)
+        self._title_bar.manage_accounts_requested.connect(self._open_accounts)
+        self._title_bar.mods_clicked.connect(self._open_mod_manager)
+        self._title_bar.skins_clicked.connect(self._open_skin_manager)
+
     def _load_versions(self, force_refresh: bool = False):
         if self._version_manager is None:
             return
@@ -693,22 +929,48 @@ class MainWindow(QMainWindow):
         self._installed_ids = installed_ids
         self._latest_release = latest_release
         self._latest_snapshot = latest_snapshot
+
+        self._installed_loaders = {}
+        if self._modloader_manager:
+            try:
+                modded_versions = self._modloader_manager.get_installed_modded_versions()
+                for vid, loader_type in modded_versions:
+                    self._installed_loaders[vid] = loader_type
+                    if vid not in self._installed_ids:
+                        self._installed_ids.add(vid)
+                        is_existing = False
+                        for v in self._all_versions:
+                            if v.get("id") == vid:
+                                is_existing = True
+                                break
+                        if not is_existing:
+                            self._all_versions.append({
+                                "id": vid,
+                                "type": "local",
+                                "release_time": "",
+                                "url": "",
+                                "loader_type": loader_type
+                            })
+            except Exception as e:
+                logger.error("检测已安装模组加载器版本失败: %s", e)
+
         self._apply_filter()
         self._refresh_btn.setEnabled(True)
         self._refresh_btn.setText("↻")
-        self.set_download_status(f"共 {len(versions)} 个版本，已安装 {len(installed_ids)} 个")
+        total_installed = len(self._installed_ids)
+        self.set_download_status(f"共 {len(versions) + len(self._installed_loaders)} 个版本，已安装 {total_installed} 个")
 
         from src.utils.config import get_config
         config = get_config()
         default_ver = config.get("default_version", "")
-        if default_ver and default_ver in installed_ids:
+        if default_ver and default_ver in self._installed_ids:
             for i in range(self._version_list.count()):
                 item = self._version_list.item(i)
                 widget = self._version_list.itemWidget(item)
                 if isinstance(widget, VersionListItem) and widget.version_id == default_ver:
                     self._version_list.setCurrentItem(item)
                     break
-        elif installed_ids:
+        elif self._installed_ids:
             for i in range(self._version_list.count()):
                 item = self._version_list.item(i)
                 widget = self._version_list.itemWidget(item)
@@ -758,14 +1020,17 @@ class MainWindow(QMainWindow):
             is_installed = vid in self._installed_ids
             is_latest = vid == self._latest_release
 
+            loader_type = v.get("loader_type") or self._installed_loaders.get(vid, "vanilla")
+
             item = QListWidgetItem()
             item.setSizeHint(QSize(0, 76))
             widget = VersionListItem(
-                vid, vtype, release_time, is_installed, is_latest
+                vid, vtype, release_time, is_installed, is_latest, loader_type
             )
             widget.download_clicked.connect(self._start_download)
             widget.cancel_clicked.connect(self._cancel_download)
             widget.delete_clicked.connect(self._delete_version)
+            widget.install_loader_clicked.connect(self._open_install_loader_dialog)
             self._version_list.addItem(item)
             self._version_list.setItemWidget(item, widget)
             self._version_items[vid] = widget
@@ -805,28 +1070,7 @@ class MainWindow(QMainWindow):
             self._show_from_tray()
 
     def _change_username(self) -> None:
-        from src.utils.config import get_config
-        config = get_config()
-        current_name = config.get("offline_username", "Steve")
-
-        name, ok = QInputDialog.getText(
-            self,
-            self.tr("更改用户名"),
-            self.tr("请输入玩家名（离线模式）:"),
-            text=current_name
-        )
-        if ok and name.strip():
-            name = name.strip()
-            if len(name) > 16:
-                Toast.error(self.tr("玩家名不能超过 16 个字符"))
-                return
-            if not name.replace("_", "").isalnum():
-                Toast.error(self.tr("玩家名只能包含字母、数字和下划线"))
-                return
-            config.set("offline_username", name)
-            config.save()
-            self.set_account_info(name, is_microsoft=False)
-            Toast.success(self.tr("用户名已更新为: ") + name)
+        self._open_accounts()
 
     def _on_launch(self) -> None:
         if self._is_launching or self._is_game_running:
@@ -840,9 +1084,27 @@ class MainWindow(QMainWindow):
             Toast.warning(self.tr("该版本尚未安装，请先下载"))
             return
 
+        if not self._account_manager:
+            Toast.error(self.tr("账号系统未初始化"))
+            return
+
+        account = self._account_manager.get_selected()
+        if not account:
+            Toast.warning(self.tr("请先添加一个账号"))
+            self._open_accounts()
+            return
+
+        if account.is_microsoft:
+            valid = self._account_manager.ensure_valid_token(account)
+            if valid is None:
+                Toast.error(self.tr("正版账号登录已过期，请重新登录"))
+                self._open_accounts()
+                return
+            account = valid
+
         from src.utils.config import get_config
         config = get_config()
-        username = config.get("offline_username", "Steve")
+        username = account.username
 
         java_path = self._java_path_combo.currentData()
         if not java_path:
@@ -875,6 +1137,7 @@ class MainWindow(QMainWindow):
             java_path=java_path,
             game_dir=game_dir,
             max_memory_gb=max_memory_gb,
+            account=account,
         )
         self._launch_thread.launch_started.connect(self._on_launch_started)
         self._launch_thread.launch_progress.connect(self._on_launch_progress)
@@ -980,6 +1243,88 @@ class MainWindow(QMainWindow):
         self._log_window.show()
         self._log_window.activateWindow()
         self._log_window.raise_()
+
+    def _join_server_direct(self, address: str, port: int, name: str) -> None:
+        if self._is_launching or self._is_game_running:
+            Toast.warning(self.tr("游戏已在运行中"))
+            return
+
+        if not self._selected_version:
+            Toast.warning(self.tr("请先在「版本」标签页选择一个版本"))
+            self._switch_page(0)
+            return
+
+        if self._selected_version not in self._installed_ids:
+            Toast.warning(self.tr("该版本尚未安装，请先下载"))
+            self._switch_page(0)
+            return
+
+        if not self._account_manager:
+            Toast.error(self.tr("账号系统未初始化"))
+            return
+
+        account = self._account_manager.get_selected()
+        if not account:
+            Toast.warning(self.tr("请先添加一个账号"))
+            self._open_accounts()
+            return
+
+        if account.is_microsoft:
+            valid = self._account_manager.ensure_valid_token(account)
+            if valid is None:
+                Toast.error(self.tr("正版账号登录已过期，请重新登录"))
+                self._open_accounts()
+                return
+            account = valid
+
+        from src.utils.config import get_config
+        username = account.username
+
+        java_path = self._java_path_combo.currentData()
+        if not java_path:
+            java_path = self._java_path_combo.currentText()
+        if java_path == self.tr("自动检测"):
+            java_path = ""
+
+        game_dir = self._game_dir_combo.currentText()
+        if not game_dir:
+            game_dir = str(Path.home() / ".minecraft")
+
+        max_memory_gb = self._memory_slider.value()
+
+        self._is_launching = True
+        self._nav_versions_btn.setChecked(True)
+        self._nav_servers_btn.setChecked(False)
+        self._left_stack.setCurrentIndex(0)
+        self._right_stack.setCurrentIndex(0)
+        self._launch_btn.setEnabled(False)
+        self._launch_btn.setText(self.tr("启动中..."))
+        self._launch_spinner.show()
+        self._launch_spinner.start()
+        self._launch_status.show()
+        self._launch_status.setText(self.tr("正在加入服务器 ") + name + "...")
+        self.set_download_status(self.tr("正在加入服务器 ") + name + "...")
+
+        self._log_window = GameLogWindow(self)
+        self._log_window.set_game_running(True, self._selected_version)
+        self._log_window.kill_requested.connect(self._kill_game)
+
+        self._launch_thread = LaunchThread(
+            version_id=self._selected_version,
+            username=username,
+            java_path=java_path,
+            game_dir=game_dir,
+            max_memory_gb=max_memory_gb,
+            account=account,
+            server_address=address,
+            server_port=port,
+        )
+        self._launch_thread.launch_started.connect(self._on_launch_started)
+        self._launch_thread.launch_progress.connect(self._on_launch_progress)
+        self._launch_thread.launch_log.connect(self._on_launch_log)
+        self._launch_thread.launch_finished.connect(self._on_launch_finished)
+        self._launch_thread.game_exited.connect(self._on_game_exited)
+        self._launch_thread.start()
 
     def _reset_launch_button(self) -> None:
         self._is_launching = False
@@ -1293,12 +1638,70 @@ class MainWindow(QMainWindow):
     def _open_accounts(self) -> None:
         from .account_dialog import AccountDialog
         dialog = AccountDialog(self)
+        dialog.accounts_changed.connect(self._refresh_account_display)
+        dialog.account_selected.connect(lambda uuid: self._refresh_account_display())
         dialog.exec()
 
     def _open_downloads(self) -> None:
         from .download_dialog import DownloadDialog
         dialog = DownloadDialog(self)
         dialog.exec()
+
+    def _open_mod_manager(self) -> None:
+        if not self._modloader_manager:
+            Toast.warning(self.tr("模组管理器未初始化"))
+            return
+        try:
+            from .mod_manager_dialog import ModManagerDialog
+            dialog = ModManagerDialog(mods_dir=self._modloader_manager.mods_dir, parent=self)
+            dialog.mods_changed.connect(self._on_mods_changed)
+            dialog.exec()
+        except Exception as e:
+            logger.error("打开模组管理器失败: %s", e, exc_info=True)
+            Toast.error(self.tr(f"打开模组管理器失败: {e}"))
+
+    def _on_mods_changed(self):
+        pass
+
+    def _open_skin_manager(self) -> None:
+        try:
+            from .skin_dialog import SkinManagerDialog
+            account = None
+            if self._account_manager:
+                account = self._account_manager.get_selected()
+            dialog = SkinManagerDialog(account=account, parent=self)
+            dialog.skin_changed.connect(self._on_skin_changed)
+            dialog.exec()
+        except Exception as e:
+            logger.error("打开皮肤管理器失败: %s", e, exc_info=True)
+            Toast.error(self.tr(f"打开皮肤管理器失败: {e}"))
+
+    def _on_skin_changed(self):
+        self._refresh_account_display()
+
+    def _open_install_loader_dialog(self, version_id: str):
+        if not self._game_dir:
+            Toast.warning(self.tr("游戏目录未设置"))
+            return
+        try:
+            from .modloader_install_dialog import ModLoaderInstallDialog
+            dialog = ModLoaderInstallDialog(mc_version=version_id, game_dir=self._game_dir, parent=self)
+            dialog.install_completed.connect(self._on_loader_installed)
+            dialog.exec()
+        except Exception as e:
+            logger.error("打开加载器安装对话框失败: %s", e, exc_info=True)
+            Toast.error(self.tr(f"打开安装对话框失败: {e}"))
+
+    def _on_loader_installed(self, mc_version: str, loader_type: str, version_id: str):
+        self._load_versions(force_refresh=True)
+        loader_names = {
+            "forge": "Forge",
+            "fabric": "Fabric",
+            "quilt": "Quilt",
+            "neoforge": "NeoForge"
+        }
+        loader_name = loader_names.get(loader_type, loader_type.capitalize())
+        Toast.success(self.tr(f"{loader_name} 加载器安装成功！"))
 
     def set_account_info(self, username: str, is_microsoft: bool = False) -> None:
         self._welcome_label.setText(self.tr("欢迎回来，") + username + "！")

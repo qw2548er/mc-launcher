@@ -13,16 +13,19 @@ class VersionListItem(QWidget):
     download_clicked = pyqtSignal(str)
     cancel_clicked = pyqtSignal(str)
     delete_clicked = pyqtSignal(str)
+    install_loader_clicked = pyqtSignal(str)
 
     def __init__(self, version_id: str, version_type: str = "release",
                  release_time: str = "", is_installed: bool = False,
-                 is_latest: bool = False, parent=None):
+                 is_latest: bool = False, loader_type: str = "vanilla",
+                 parent=None):
         super().__init__(parent)
         self.version_id = version_id
         self.version_type = version_type
         self.release_time = release_time
         self.is_installed = is_installed
         self.is_latest = is_latest
+        self.loader_type = loader_type
         self.is_downloading = False
         self.download_progress = 0
         self.download_speed = ""
@@ -72,6 +75,20 @@ class VersionListItem(QWidget):
                 }
             """)
             name_layout.addWidget(latest_tag)
+
+        if self.loader_type != "vanilla":
+            loader_tag = QLabel(self._get_loader_text())
+            loader_tag.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {self._get_loader_color()};
+                    color: white;
+                    padding: 2px 8px;
+                    border-radius: 4px;
+                    font-size: 9px;
+                    font-weight: bold;
+                }}
+            """)
+            name_layout.addWidget(loader_tag)
 
         self.type_label = QLabel(self._get_type_text())
         self.type_label.setStyleSheet(f"""
@@ -130,11 +147,36 @@ class VersionListItem(QWidget):
 
         layout.addLayout(info_layout, stretch=1)
 
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
+
+        self.install_loader_btn = QPushButton("安装加载器")
+        self.install_loader_btn.setFixedSize(90, 32)
+        self.install_loader_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_loader_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7C3AED;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #6D28D9;
+            }
+        """)
+        self.install_loader_btn.clicked.connect(self._on_install_loader_clicked)
+        self.install_loader_btn.hide()
+        btn_layout.addWidget(self.install_loader_btn)
+
         self.action_btn = QPushButton()
         self.action_btn.setFixedSize(80, 32)
         self.action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.action_btn.clicked.connect(self._on_action_clicked)
-        layout.addWidget(self.action_btn)
+        btn_layout.addWidget(self.action_btn)
+
+        layout.addLayout(btn_layout)
 
         self.setMinimumHeight(64)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -168,6 +210,24 @@ class VersionListItem(QWidget):
         }
         return color_map.get(self.version_type, "#607D8B")
 
+    def _get_loader_text(self) -> str:
+        loader_map = {
+            "forge": "Forge",
+            "fabric": "Fabric",
+            "quilt": "Quilt",
+            "neoforge": "NeoForge"
+        }
+        return loader_map.get(self.loader_type, self.loader_type)
+
+    def _get_loader_color(self) -> str:
+        color_map = {
+            "forge": "#F16436",
+            "fabric": "#D8BFD8",
+            "quilt": "#9966CC",
+            "neoforge": "#E74C3C"
+        }
+        return color_map.get(self.loader_type, "#607D8B")
+
     def set_installed(self, installed: bool):
         self.is_installed = installed
         if installed:
@@ -187,7 +247,14 @@ class VersionListItem(QWidget):
                     background-color: #d32f2f;
                 }
             """)
-            self.status_label.setText("已安装")
+            if self.loader_type == "vanilla":
+                self.install_loader_btn.show()
+                status_text = "已安装"
+            else:
+                self.install_loader_btn.hide()
+                loader_name = self._get_loader_text()
+                status_text = f"已安装 ({loader_name})"
+            self.status_label.setText(status_text)
             self.status_label.setStyleSheet("color: #4CAF50;")
             self.progress_bar.hide()
             self.is_downloading = False
@@ -207,6 +274,7 @@ class VersionListItem(QWidget):
                     background-color: #1976D2;
                 }
             """)
+            self.install_loader_btn.hide()
             self.status_label.setText("未安装")
             self.status_label.setStyleSheet("color: #888888;")
             self.progress_bar.hide()
@@ -231,6 +299,7 @@ class VersionListItem(QWidget):
                     background-color: #F57C00;
                 }
             """)
+            self.install_loader_btn.hide()
             self.progress_bar.show()
             self.status_label.setStyleSheet("color: #2196F3;")
         else:
@@ -295,3 +364,6 @@ class VersionListItem(QWidget):
             self.delete_clicked.emit(self.version_id)
         else:
             self.download_clicked.emit(self.version_id)
+
+    def _on_install_loader_clicked(self):
+        self.install_loader_clicked.emit(self.version_id)

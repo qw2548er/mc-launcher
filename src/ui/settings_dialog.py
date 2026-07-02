@@ -290,6 +290,7 @@ class SettingsDialog(QDialog):
         self._content_stack.addTab(page, "game")
 
     def _setup_download_tab(self) -> None:
+        from PyQt6.QtCore import QTimer
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(32, 28, 32, 28)
@@ -299,14 +300,46 @@ class SettingsDialog(QDialog):
         source_layout = QGridLayout()
         source_layout.setSpacing(14)
 
-        source_layout.addWidget(QLabel(self.tr("下载源")), 0, 0)
+        source_layout.addWidget(QLabel(self.tr("当前下载源")), 0, 0)
         self._source_combo = QComboBox()
-        self._source_combo.addItems([
-            self.tr("官方源 (Mojang)"),
-            self.tr("BMCLAPI 镜像"),
-            self.tr("MCBBS 镜像"),
-        ])
         source_layout.addWidget(self._source_combo, 0, 1)
+
+        self._speed_test_btn = QPushButton(self.tr("测速并选择最快"))
+        self._speed_test_btn.clicked.connect(self._start_speed_test)
+        source_layout.addWidget(self._speed_test_btn, 0, 2)
+
+        self._source_status_label = QLabel("")
+        self._source_status_label.setStyleSheet("color: #9CA3AF; font-size: 12px;")
+        source_layout.addWidget(self._source_status_label, 1, 0, 1, 3)
+
+        self._source_desc_label = QLabel("")
+        self._source_desc_label.setWordWrap(True)
+        self._source_desc_label.setStyleSheet("color: #6B7280; font-size: 11px;")
+        source_layout.addWidget(self._source_desc_label, 2, 0, 1, 3)
+
+        custom_box = QGroupBox(self.tr("自定义镜像"))
+        custom_layout = QGridLayout()
+        custom_layout.setSpacing(10)
+
+        custom_layout.addWidget(QLabel(self.tr("镜像地址")), 0, 0)
+        self._custom_url_edit = QLineEdit()
+        self._custom_url_edit.setPlaceholderText("https://example.com/mirror")
+        custom_layout.addWidget(self._custom_url_edit, 0, 1)
+
+        custom_layout.addWidget(QLabel(self.tr("名称")), 1, 0)
+        self._custom_name_edit = QLineEdit()
+        self._custom_name_edit.setPlaceholderText("我的镜像")
+        custom_layout.addWidget(self._custom_name_edit, 1, 1)
+
+        add_custom_btn = QPushButton(self.tr("添加"))
+        add_custom_btn.clicked.connect(self._add_custom_source)
+        custom_layout.addWidget(add_custom_btn, 2, 1)
+
+        custom_box.setLayout(custom_layout)
+        source_layout.addWidget(custom_box, 3, 0, 1, 3)
+
+        self._populate_sources()
+        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
 
         source_group.setLayout(source_layout)
         layout.addWidget(source_group)
@@ -331,6 +364,9 @@ class SettingsDialog(QDialog):
         self._verify_check = QCheckBox(self.tr("下载完成后校验文件哈希"))
         self._verify_check.setChecked(True)
         dl_layout.addWidget(self._verify_check, 2, 0, 1, 2)
+
+        self._auto_select_check = QCheckBox(self.tr("启动时自动测速并选择最快下载源"))
+        dl_layout.addWidget(self._auto_select_check, 3, 0, 1, 2)
 
         dl_group.setLayout(dl_layout)
         layout.addWidget(dl_group)
@@ -408,6 +444,111 @@ class SettingsDialog(QDialog):
 
         parent_layout.addWidget(bar)
 
+    def _populate_sources(self) -> None:
+        from src.utils.download_source import get_download_source_manager
+        manager = get_download_source_manager()
+        self._source_combo.blockSignals(True)
+        self._source_combo.clear()
+        self._source_ids = []
+        current_id = manager.current_source.id
+        current_idx = 0
+        for i, src in enumerate(manager.sources):
+            self._source_combo.addItem(src.name)
+            self._source_ids.append(src.id)
+            if src.id == current_id:
+                current_idx = i
+        self._source_combo.setCurrentIndex(current_idx)
+        self._source_combo.blockSignals(False)
+        self._update_source_info()
+
+    def _update_source_info(self) -> None:
+        from src.utils.download_source import get_download_source_manager
+        manager = get_download_source_manager()
+        idx = self._source_combo.currentIndex()
+        if 0 <= idx < len(self._source_ids):
+            src = manager.get_source(self._source_ids[idx])
+            if src:
+                speed_text = ""
+                result = manager.get_speed_result(src.id)
+                if result and result.success:
+                    speed_text = f" | 测速: {result.speed_formatted}"
+                elif src.last_speed > 0:
+                    speed_text = f" | 上次测速: {src.last_speed / 1024:.1f} KB/s"
+                self._source_status_label.setText(f"当前: {src.name}{speed_text}")
+                self._source_desc_label.setText(src.description)
+
+    def _on_source_changed(self, index: int) -> None:
+        self._update_source_info()
+
+    def _start_speed_test(self) -> None:
+        from src.utils.download_source import get_download_source_manager, SpeedTestResult
+        from PyQt6.QtCore import QTimer
+        manager = get_download_source_manager()
+
+        self._speed_test_btn.setEnabled(False)
+        self._speed_test_btn.setText(self.tr("测速中..."))
+        self._source_status_label.setText(self.tr("正在测速，请稍候..."))
+
+        results_status = {}
+
+        from src.utils.download_source import SourceType
+
+        def on_progress(source_id: str, result: SpeedTestResult):
+            results_status[source_id] = result
+            done = len(results_status)
+            total = len([s for s in manager.sources if s.source_type != SourceType.CUSTOM])
+            if result.success:
+                self._source_status_label.setText(
+                    self.tr("测速中... (%d/%d) %s: %s") % (
+                        done, total, source_id, result.speed_formatted
+                    )
+                )
+            else:
+                self._source_status_label.setText(
+                    self.tr("测速中... (%d/%d) %s: 失败") % (done, total, source_id)
+                )
+
+        def on_complete():
+            fastest = manager.auto_select_fastest()
+            self._speed_test_btn.setEnabled(True)
+            self._speed_test_btn.setText(self.tr("测速并选择最快"))
+            self._populate_sources()
+            if fastest:
+                src = manager.get_source(fastest)
+                if src:
+                    self._source_status_label.setText(
+                        self.tr("测速完成，已自动选择最快源: %s") % src.name
+                    )
+            else:
+                self._source_status_label.setText(self.tr("测速完成，所有源均不可用"))
+
+        manager.speed_test_all(on_progress, on_complete)
+
+    def _add_custom_source(self) -> None:
+        from src.utils.download_source import get_download_source_manager
+        from .widgets import Toast
+
+        url = self._custom_url_edit.text().strip()
+        name = self._custom_name_edit.text().strip() or "自定义镜像"
+
+        if not url:
+            Toast.warning(self.tr("请输入镜像地址"))
+            return
+
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        manager = get_download_source_manager()
+        source_id = manager.add_custom_source(url, name)
+        self._custom_url_edit.clear()
+        self._custom_name_edit.clear()
+        self._populate_sources()
+
+        idx = self._source_ids.index(source_id) if source_id in self._source_ids else -1
+        if idx >= 0:
+            self._source_combo.setCurrentIndex(idx)
+        Toast.success(self.tr("自定义镜像已添加"))
+
     def _switch_tab(self, key: str, active_btn: QPushButton) -> None:
         for i in range(self._content_stack.count()):
             if self._content_stack.tabText(i) == key:
@@ -474,6 +615,15 @@ class SettingsDialog(QDialog):
             saved_java = config.get("java_path", "")
             if saved_java and hasattr(self, '_java_manager'):
                 self._java_manager.select_java_by_path(saved_java)
+
+            if hasattr(self, '_threads_spin'):
+                self._threads_spin.setValue(config.get("download.max_threads", 16))
+            if hasattr(self, '_speed_spin'):
+                self._speed_spin.setValue(config.get("download.speed_limit", 0))
+            if hasattr(self, '_verify_check'):
+                self._verify_check.setChecked(config.get("download.verify", True))
+            if hasattr(self, '_auto_select_check'):
+                self._auto_select_check.setChecked(config.get("download.auto_select", False))
         except Exception as e:
             logger.debug("加载设置失败: %s", e)
 
@@ -516,9 +666,18 @@ class SettingsDialog(QDialog):
             config.set("launch.close_launcher", self._close_launcher_check.isChecked())
             config.set("demo_mode", self._demo_mode_check.isChecked())
             config.set("download.source", self._source_combo.currentIndex())
+
+            if hasattr(self, '_source_ids'):
+                idx = self._source_combo.currentIndex()
+                if 0 <= idx < len(self._source_ids):
+                    from src.utils.download_source import get_download_source_manager
+                    manager = get_download_source_manager()
+                    manager.set_current(self._source_ids[idx])
+
             config.set("download.max_threads", self._threads_spin.value())
             config.set("download.speed_limit", self._speed_spin.value())
             config.set("download.verify", self._verify_check.isChecked())
+            config.set("download.auto_select", self._auto_select_check.isChecked())
 
             config.save()
         except Exception as e:

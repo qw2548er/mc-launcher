@@ -7,6 +7,7 @@ from .toast import Toast, ToastType
 from .loading_spinner import LoadingSpinner
 from .download_item import DownloadItemWidget
 from .version_list_item import VersionListItem
+from .player_avatar import PlayerAvatar
 
 __all__ = [
     "TitleBar",
@@ -17,4 +18,5 @@ __all__ = [
     "LoadingSpinner",
     "DownloadItemWidget",
     "VersionListItem",
+    "PlayerAvatar",
 ]
