@@ -1,16 +1,19 @@
 """主窗口模块。
 
 实现 Minecraft 启动器的主界面，包含版本列表、启动按钮、快速设置和状态栏。
+集成真实版本管理、下载进度显示功能。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import (
-    Qt, QSize, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QEvent
+    Qt, QSize, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QEvent, QThread
 )
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QPainter, QColor, QBrush, QLinearGradient
 from PyQt6.QtWidgets import (
@@ -28,20 +31,128 @@ from .styles import ThemeManager, Theme
 logger = logging.getLogger(__name__)
 
 
+class VersionLoadThread(QThread):
+    versions_loaded = pyqtSignal(list, set, str, str)
+    load_failed = pyqtSignal(str)
+
+    def __init__(self, version_manager, force_refresh=False):
+        super().__init__()
+        self._vm = version_manager
+        self._force_refresh = force_refresh
+
+    def run(self):
+        try:
+            manifest = self._vm.fetch_remote_versions(force_refresh=self._force_refresh)
+            installed = self._vm.get_installed_versions()
+            installed_ids = {v.id for v in installed}
+            versions = []
+            for v in manifest.versions:
+                versions.append({
+                    "id": v.id,
+                    "type": v.type,
+                    "release_time": v.release_time[:10] if v.release_time else "",
+                    "url": v.url
+                })
+            self.versions_loaded.emit(
+                versions,
+                installed_ids,
+                manifest.latest_release,
+                manifest.latest_snapshot
+            )
+        except Exception as e:
+            logger.error("加载版本列表失败: %s", e)
+            self.load_failed.emit(str(e))
+
+
+class DownloadThread(QThread):
+    progress_updated = pyqtSignal(float, str, str, str)
+    download_finished = pyqtSignal(bool, str)
+    status_changed = pyqtSignal(str)
+
+    def __init__(self, version_manager, version_id: str, include_assets: bool = True):
+        super().__init__()
+        self._vm = version_manager
+        self._version_id = version_id
+        self._include_assets = include_assets
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+        self._vm.cancel_install()
+
+    def run(self):
+        try:
+            self.status_changed.emit("正在获取版本信息...")
+
+            def on_progress(report):
+                if self._cancel:
+                    return
+                progress = report.progress
+                speed = report.speed_formatted
+
+                if report.remaining_time > 0:
+                    remaining_secs = int(report.remaining_time)
+                    if remaining_secs < 60:
+                        eta = f"{remaining_secs}秒"
+                    elif remaining_secs < 3600:
+                        eta = f"{remaining_secs // 60}分{remaining_secs % 60}秒"
+                    else:
+                        eta = f"{remaining_secs // 3600}时{(remaining_secs % 3600) // 60}分"
+                else:
+                    eta = ""
+
+                current_file = ""
+                if report.current_item:
+                    tag = report.current_item.tag or ""
+                    if tag.startswith("asset:"):
+                        current_file = tag.replace("asset:", "")
+                    elif tag == "client":
+                        current_file = "client.jar"
+                    elif tag == "library":
+                        current_file = report.current_item.path.name
+                    elif tag == "native":
+                        current_file = report.current_item.path.name
+                    elif tag == "asset_index":
+                        current_file = "资源索引"
+
+                self.progress_updated.emit(progress, speed, eta, current_file)
+
+            success = self._vm.install_version(
+                self._version_id,
+                progress_callback=on_progress,
+                include_assets=self._include_assets
+            )
+            msg = "安装成功" if success else "安装失败"
+            self.download_finished.emit(success, msg)
+        except Exception as e:
+            logger.error("下载版本异常: %s", e, exc_info=True)
+            self.download_finished.emit(False, str(e))
+
+
 class MainWindow(QMainWindow):
     launch_clicked = pyqtSignal(str)
     version_selected = pyqtSignal(str)
-    install_version_requested = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self._selected_version: Optional[str] = None
         self._is_launching = False
         self._drag_position = None
+        self._version_manager = None
+        self._version_items: dict[str, VersionListItem] = {}
+        self._all_versions: list[dict] = []
+        self._installed_ids: set[str] = set()
+        self._latest_release: str = ""
+        self._latest_snapshot: str = ""
+        self._download_thread: Optional[DownloadThread] = None
+        self._downloading_version: Optional[str] = None
+
         self._setup_window()
         self._setup_ui()
         self._setup_tray()
         self._connect_signals()
+
+        QTimer.singleShot(100, self._init_version_manager)
 
     def _setup_window(self) -> None:
         self.setWindowTitle(self.tr("Minecraft Launcher"))
@@ -52,6 +163,18 @@ class MainWindow(QMainWindow):
             Qt.WindowType.Window
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+
+    def _init_version_manager(self):
+        try:
+            from src.version.version_manager import VersionManager
+            from src.utils.config import get_config
+            config = get_config()
+            game_dir = Path(config.get("game_directory", str(Path.home() / ".minecraft")))
+            self._version_manager = VersionManager(game_dir=game_dir)
+            self._load_versions(force_refresh=False)
+        except Exception as e:
+            logger.error("初始化版本管理器失败: %s", e, exc_info=True)
+            Toast.error(f"版本管理器初始化失败: {e}")
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -84,7 +207,7 @@ class MainWindow(QMainWindow):
 
     def _setup_version_list(self, parent_layout: QHBoxLayout) -> None:
         left_panel = QWidget()
-        left_panel.setFixedWidth(280)
+        left_panel.setFixedWidth(300)
         left_panel.setObjectName("LeftPanel")
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -107,18 +230,13 @@ class MainWindow(QMainWindow):
         self._refresh_btn.setToolTip(self.tr("刷新版本列表"))
         header_layout.addWidget(self._refresh_btn)
 
-        self._install_btn = QPushButton("+")
-        self._install_btn.setObjectName("IconButton")
-        self._install_btn.setFixedSize(32, 32)
-        self._install_btn.setToolTip(self.tr("安装新版本"))
-        header_layout.addWidget(self._install_btn)
-
         left_layout.addWidget(header)
 
         self._version_list = QListWidget()
         self._version_list.setObjectName("VersionList")
         self._version_list.setSpacing(2)
         self._version_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._version_list.setFrameShape(QFrame.Shape.NoFrame)
         left_layout.addWidget(self._version_list, 1)
 
         filter_row = QWidget()
@@ -128,11 +246,13 @@ class MainWindow(QMainWindow):
 
         self._filter_combo = QComboBox()
         self._filter_combo.addItems([
-            self.tr("全部版本"),
             self.tr("正式版"),
+            self.tr("全部版本"),
             self.tr("快照版"),
+            self.tr("远古版"),
             self.tr("已安装"),
         ])
+        self._filter_combo.setCurrentIndex(0)
         filter_layout.addWidget(self._filter_combo)
 
         left_layout.addWidget(filter_row)
@@ -346,7 +466,97 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self._version_list.currentItemChanged.connect(self._on_version_changed)
         self._refresh_btn.clicked.connect(self._refresh_versions)
-        self._install_btn.clicked.connect(self._install_selected_version)
+        self._filter_combo.currentIndexChanged.connect(self._apply_filter)
+
+    def _load_versions(self, force_refresh: bool = False):
+        if self._version_manager is None:
+            return
+        self._refresh_btn.setEnabled(False)
+        self._refresh_btn.setText("⟳")
+        self.set_download_status("正在加载版本列表...")
+
+        self._load_thread = VersionLoadThread(self._version_manager, force_refresh)
+        self._load_thread.versions_loaded.connect(self._on_versions_loaded)
+        self._load_thread.load_failed.connect(self._on_versions_load_failed)
+        self._load_thread.start()
+
+    def _on_versions_loaded(self, versions, installed_ids, latest_release, latest_snapshot):
+        self._all_versions = versions
+        self._installed_ids = installed_ids
+        self._latest_release = latest_release
+        self._latest_snapshot = latest_snapshot
+        self._apply_filter()
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText("↻")
+        self.set_download_status(f"共 {len(versions)} 个版本，已安装 {len(installed_ids)} 个")
+
+        from src.utils.config import get_config
+        config = get_config()
+        default_ver = config.get("default_version", "")
+        if default_ver and default_ver in installed_ids:
+            for i in range(self._version_list.count()):
+                item = self._version_list.item(i)
+                widget = self._version_list.itemWidget(item)
+                if isinstance(widget, VersionListItem) and widget.version_id == default_ver:
+                    self._version_list.setCurrentItem(item)
+                    break
+
+    def _on_versions_load_failed(self, error):
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText("↻")
+        self.set_download_status("版本列表加载失败")
+        Toast.error(f"加载版本列表失败: {error}")
+
+    def _apply_filter(self):
+        if not self._all_versions:
+            return
+
+        filter_idx = self._filter_combo.currentIndex()
+        self._version_list.clear()
+        self._version_items.clear()
+
+        filtered = []
+        for v in self._all_versions:
+            vtype = v.get("type", "release")
+            vid = v.get("id", "")
+            is_installed = vid in self._installed_ids
+
+            if filter_idx == 0:
+                if vtype == "release":
+                    filtered.append(v)
+            elif filter_idx == 1:
+                filtered.append(v)
+            elif filter_idx == 2:
+                if vtype == "snapshot":
+                    filtered.append(v)
+            elif filter_idx == 3:
+                if vtype in ("old_beta", "old_alpha"):
+                    filtered.append(v)
+            elif filter_idx == 4:
+                if is_installed:
+                    filtered.append(v)
+
+        for v in filtered:
+            vid = v.get("id", "")
+            vtype = v.get("type", "release")
+            release_time = v.get("release_time", "")
+            is_installed = vid in self._installed_ids
+            is_latest = vid == self._latest_release
+
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 76))
+            widget = VersionListItem(
+                vid, vtype, release_time, is_installed, is_latest
+            )
+            widget.download_clicked.connect(self._start_download)
+            widget.cancel_clicked.connect(self._cancel_download)
+            widget.delete_clicked.connect(self._delete_version)
+            self._version_list.addItem(item)
+            self._version_list.setItemWidget(item, widget)
+            self._version_items[vid] = widget
+
+            if self._downloading_version == vid:
+                widget.set_downloading(True)
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
@@ -372,6 +582,11 @@ class MainWindow(QMainWindow):
     def _on_launch(self) -> None:
         if self._is_launching or not self._selected_version:
             return
+
+        if self._selected_version not in self._installed_ids:
+            Toast.warning("该版本尚未安装，请先下载")
+            return
+
         self._is_launching = True
         self._launch_btn.setEnabled(False)
         self._launch_btn.setText(self.tr("启动中..."))
@@ -382,7 +597,10 @@ class MainWindow(QMainWindow):
     def _reset_launch_button(self) -> None:
         self._is_launching = False
         self._launch_spinner.stop()
-        self._launch_btn.setEnabled(self._selected_version is not None)
+        can_launch = (self._selected_version is not None and
+                      self._selected_version in self._installed_ids and
+                      self._downloading_version is None)
+        self._launch_btn.setEnabled(can_launch)
         self._launch_btn.setText(self.tr("启动游戏"))
 
     def _on_version_changed(self, current: QListWidgetItem, previous) -> None:
@@ -395,15 +613,128 @@ class MainWindow(QMainWindow):
         if isinstance(widget, VersionListItem):
             self._selected_version = widget.version_id
             self._version_display.setText(widget.version_id)
-            self._launch_btn.setEnabled(True)
+            can_launch = (widget.version_id in self._installed_ids and
+                          self._downloading_version is None)
+            self._launch_btn.setEnabled(can_launch)
             self.version_selected.emit(widget.version_id)
 
     def _refresh_versions(self) -> None:
         Toast.info(self.tr("正在刷新版本列表..."))
+        self._load_versions(force_refresh=True)
 
-    def _install_selected_version(self) -> None:
-        if self._selected_version:
-            self.install_version_requested.emit(self._selected_version)
+    def _start_download(self, version_id: str):
+        if self._downloading_version is not None:
+            Toast.warning(f"已有版本正在下载: {self._downloading_version}")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "下载版本",
+            f"确定要下载版本 {version_id} 吗？\n这将下载客户端、库文件和资源文件。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._downloading_version = version_id
+        widget = self._version_items.get(version_id)
+        if widget:
+            widget.set_downloading(True)
+            widget.update_progress(0, "准备中...", "", "")
+
+        self._launch_btn.setEnabled(False)
+        self.set_download_status(f"正在下载 {version_id}...")
+
+        self._download_thread = DownloadThread(
+            self._version_manager, version_id, include_assets=True
+        )
+        self._download_thread.progress_updated.connect(self._on_download_progress)
+        self._download_thread.download_finished.connect(self._on_download_finished)
+        self._download_thread.status_changed.connect(self._on_download_status)
+        self._download_thread.start()
+
+    def _cancel_download(self, version_id: str):
+        if self._download_thread and self._downloading_version == version_id:
+            reply = QMessageBox.question(
+                self,
+                "取消下载",
+                f"确定要取消下载 {version_id} 吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._download_thread.cancel()
+                Toast.info("下载已取消")
+
+    def _delete_version(self, version_id: str):
+        reply = QMessageBox.warning(
+            self,
+            "删除版本",
+            f"确定要删除版本 {version_id} 吗？\n此操作不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if self._version_manager.uninstall_version(version_id):
+                self._installed_ids.discard(version_id)
+                widget = self._version_items.get(version_id)
+                if widget:
+                    widget.set_installed(False)
+                Toast.success(f"版本 {version_id} 已删除")
+                self.set_download_status(f"共 {len(self._all_versions)} 个版本，已安装 {len(self._installed_ids)} 个")
+
+                from src.utils.config import get_config
+                config = get_config()
+                if config.get("default_version", "") == version_id:
+                    config.set("default_version", "")
+                    config.save()
+            else:
+                Toast.error(f"删除版本 {version_id} 失败")
+        except Exception as e:
+            logger.error("删除版本失败: %s", e, exc_info=True)
+            Toast.error(f"删除失败: {e}")
+
+    def _on_download_progress(self, progress, speed, eta, current_file):
+        widget = self._version_items.get(self._downloading_version)
+        if widget:
+            widget.update_progress(progress, speed, eta, current_file)
+        self.set_download_status(
+            f"下载 {self._downloading_version}: {progress:.1f}% | {speed}"
+        )
+
+    def _on_download_status(self, status):
+        widget = self._version_items.get(self._downloading_version)
+        if widget:
+            widget.update_progress(0, status, "", "")
+
+    def _on_download_finished(self, success, message):
+        version_id = self._downloading_version
+        self._downloading_version = None
+        widget = self._version_items.get(version_id)
+
+        if success:
+            self._installed_ids.add(version_id)
+            if widget:
+                widget.set_installed(True)
+            Toast.success(f"版本 {version_id} 下载完成！")
+
+            from src.utils.config import get_config
+            config = get_config()
+            config.set("default_version", version_id)
+            config.save()
+
+            if self._selected_version == version_id:
+                self._launch_btn.setEnabled(True)
+        else:
+            if widget:
+                widget.set_error(message)
+            Toast.error(f"下载 {version_id} 失败: {message}")
+
+        self.set_download_status(f"共 {len(self._all_versions)} 个版本，已安装 {len(self._installed_ids)} 个")
 
     def _browse_java(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -434,21 +765,6 @@ class MainWindow(QMainWindow):
         from .download_dialog import DownloadDialog
         dialog = DownloadDialog(self)
         dialog.exec()
-
-    def populate_versions(self, versions: list[dict], installed: set[str] | None = None,
-                          latest_release: str = "") -> None:
-        self._version_list.clear()
-        installed = installed or set()
-        for v in versions:
-            vid = v.get("id", "")
-            vtype = v.get("type", "release")
-            is_installed = vid in installed
-            is_latest = vid == latest_release
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 70))
-            widget = VersionListItem(vid, vtype, is_installed, is_latest)
-            self._version_list.addItem(item)
-            self._version_list.setItemWidget(item, widget)
 
     def set_account_info(self, username: str, is_microsoft: bool = False) -> None:
         self._welcome_label.setText(self.tr("欢迎回来，") + username + "！")

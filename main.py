@@ -1,6 +1,7 @@
 """Minecraft Launcher 应用程序入口点。
 
 提供延迟加载、全局异常捕获、首次启动向导、自动更新检查等功能。
+集成真实的 Mojang 版本列表获取和版本下载功能。
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LAUNCHER_VERSION = "1.0.0"
+LAUNCHER_VERSION = "1.1.0"
 
 
 def get_app_dir() -> Path:
@@ -105,6 +106,21 @@ def check_first_run() -> dict | None:
     return None
 
 
+def detect_java() -> str | None:
+    """自动检测 Java 安装。"""
+    try:
+        from src.core.java_detector import JavaDetector
+        detector = JavaDetector()
+        javas = detector.find_all_java()
+        if javas:
+            best = detector.find_best_java(major=17) or javas[0]
+            logger.info("检测到 Java: %s (版本 %s)", best.path, best.version)
+            return str(best.path)
+    except Exception as e:
+        logger.debug("Java 检测失败: %s", e)
+    return None
+
+
 def check_for_updates() -> None:
     """后台检查更新。"""
     try:
@@ -173,36 +189,72 @@ def main() -> int:
         window.set_memory_allocation(max_mem // 1024)
         Toast.success("配置完成，欢迎使用 Minecraft Launcher！")
     else:
+        if not java_path:
+            detected = detect_java()
+            if detected:
+                java_path = detected
+                config.set("java_path", java_path)
+                config.save()
         if java_path:
             window.set_java_path(java_path)
+            java_version = None
+            try:
+                from src.core.java_detector import JavaDetector
+                detector = JavaDetector()
+                java_info = detector.get_java_info(java_path)
+                if java_info:
+                    java_version = java_info.version
+            except Exception:
+                pass
+            if java_version:
+                window.set_java_status(java_version)
+            else:
+                window.set_java_status("已配置")
+        else:
+            Toast.warning("未检测到 Java，请在设置中手动配置 Java 路径")
+
         window.set_game_dir(game_dir)
         window.set_memory_allocation(max(1, max_mem // 1024))
 
-    demo_versions = [
-        {"id": "1.21.3", "type": "release"},
-        {"id": "1.21.1", "type": "release"},
-        {"id": "1.20.6", "type": "release"},
-        {"id": "1.20.4", "type": "release"},
-        {"id": "1.19.4", "type": "release"},
-        {"id": "1.18.2", "type": "release"},
-        {"id": "1.16.5", "type": "release"},
-        {"id": "1.12.2", "type": "release"},
-        {"id": "24w45a", "type": "snapshot"},
-        {"id": "b1.7.3", "type": "old_beta"},
-        {"id": "a1.0.4", "type": "old_alpha"},
-    ]
-    window.populate_versions(demo_versions, installed={"1.21.3", "1.20.4", "1.16.5"}, latest_release="1.21.3")
     window.set_account_info("Steve", is_microsoft=False)
-    window.set_java_status("17.0.2")
 
-    window.launch_clicked.connect(
-        lambda v: Toast.info(f"正在启动 Minecraft {v}...")
-    )
+    def on_launch(version_id: str):
+        from src.core.launcher import MinecraftLauncher, LaunchOptions
+        from src.utils.config import get_config
+        config = get_config()
+
+        try:
+            launcher = MinecraftLauncher()
+            options = LaunchOptions(
+                version=version_id,
+                game_directory=Path(window.get_game_dir()),
+                java_path=Path(window.get_java_path()) if window.get_java_path() else None,
+                max_memory_mb=window.get_memory_allocation() * 1024,
+            )
+            process = launcher.launch(options)
+            if process:
+                Toast.info(f"Minecraft {version_id} 已启动！")
+                window.hide()
+
+                def check_process():
+                    try:
+                        if process.poll() is not None:
+                            window.show()
+                            return
+                    except Exception:
+                        pass
+                    QTimer.singleShot(2000, check_process)
+
+                QTimer.singleShot(5000, check_process)
+            else:
+                Toast.error("启动失败，请检查 Java 路径和版本")
+        except Exception as e:
+            logger.error("启动游戏失败: %s", e, exc_info=True)
+            Toast.error(f"启动失败: {e}")
+
+    window.launch_clicked.connect(on_launch)
     window.version_selected.connect(
-        lambda v: logger.info("Selected version: %s", v)
-    )
-    window.install_version_requested.connect(
-        lambda v: Toast.info(f"开始安装版本 {v}")
+        lambda v: logger.info("选择版本: %s", v)
     )
 
     window.show()

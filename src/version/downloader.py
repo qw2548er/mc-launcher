@@ -28,6 +28,7 @@ from src.utils.file_utils import (
     file_exists,
     format_file_size,
     verify_sha1,
+    write_json,
 )
 from src.utils.http_utils import (
     DownloadProgressInfo,
@@ -58,6 +59,9 @@ class DownloadStatus(Enum):
     SKIPPED = "skipped"
 
 
+MAX_RETRIES = 3
+
+
 @dataclass
 class DownloadItem:
     """单个下载项。"""
@@ -72,6 +76,7 @@ class DownloadItem:
     error: str = ""
     downloaded: int = 0
     speed: float = 0.0
+    retry_count: int = 0
     _future: Optional[Future] = field(default=None, repr=False)
 
     @property
@@ -155,6 +160,7 @@ class DownloadQueue:
         max_workers: int = 4,
         client: Optional[HttpClient] = None,
         max_speed: float = 0,
+        item_completed_callback: Optional[Callable[[DownloadItem], None]] = None,
     ) -> None:
         self._client = client or HttpClient(max_speed=max_speed)
         self._max_workers = max_workers
@@ -162,9 +168,11 @@ class DownloadQueue:
         self._items: list[DownloadItem] = []
         self._report = DownloadReport()
         self._progress_callback: Optional[Callable[[DownloadReport], None]] = None
+        self._item_completed_callback = item_completed_callback
         self._lock = threading.RLock()
         self._pause_event = threading.Event()
         self._cancel_event = threading.Event()
+        self._new_items_event = threading.Event()
         self._running = False
         self._completed_count = 0
         self._total_speed = 0.0
@@ -208,6 +216,7 @@ class DownloadQueue:
             self._items.append(item)
             self._report.total_files += 1
             self._report.total_size += item.size
+            self._new_items_event.set()
 
     def add_items(self, items: list[DownloadItem]) -> None:
         """批量添加下载项。"""
@@ -215,6 +224,7 @@ class DownloadQueue:
             self._items.extend(items)
             self._report.total_files += len(items)
             self._report.total_size += sum(i.size for i in items)
+            self._new_items_event.set()
 
     def clear_completed(self) -> None:
         """清除已完成的任务记录。"""
@@ -228,6 +238,7 @@ class DownloadQueue:
         self._running = True
         self._pause_event.set()
         self._cancel_event.clear()
+        self._new_items_event.clear()
         self._client.reset_state()
         self._report = DownloadReport()
         self._report.start_time = time.monotonic()
@@ -286,42 +297,95 @@ class DownloadQueue:
         return True
 
     def _run_loop(self) -> None:
-        """下载调度循环。"""
+        """下载调度循环，支持失败自动重试和动态添加任务。"""
         try:
             futures: dict[Future, DownloadItem] = {}
+            retry_queue: list[DownloadItem] = []
+            processed_items: set[int] = set()
 
-            with self._lock:
-                pending_items = [
-                    i for i in self._items
-                    if i.status in (DownloadStatus.QUEUED, DownloadStatus.PENDING, DownloadStatus.FAILED)
-                ]
-            pending_items.sort(key=lambda x: -x.priority)
+            def get_pending_items():
+                with self._lock:
+                    return [
+                        i for i in self._items
+                        if i.status in (DownloadStatus.QUEUED, DownloadStatus.PENDING, DownloadStatus.FAILED)
+                        and id(i) not in processed_items
+                    ]
 
-            for item in pending_items:
+            all_items = get_pending_items()
+            all_items.sort(key=lambda x: -x.priority)
+            item_index = 0
+
+            while True:
                 if self._cancel_event.is_set():
                     break
+
+                new_items = get_pending_items()
+                if new_items:
+                    for item in new_items:
+                        if id(item) not in processed_items:
+                            all_items.append(item)
+                            processed_items.add(id(item))
+                    all_items.sort(key=lambda x: -x.priority)
+
+                while item_index < len(all_items) and all_items[item_index].status not in (
+                    DownloadStatus.QUEUED, DownloadStatus.PENDING, DownloadStatus.FAILED
+                ):
+                    item_index += 1
+
                 self._pause_event.wait()
                 if self._cancel_event.is_set():
                     break
 
-                while len(futures) >= self._max_workers:
-                    done_futures = [f for f in futures if f.done()]
-                    if done_futures:
-                        for f in done_futures:
-                            self._handle_completed(f, futures.pop(f))
-                    else:
-                        time.sleep(0.05)
+                done_futures = [f for f in futures if f.done()]
+                for f in done_futures:
+                    item = futures.pop(f)
+                    should_retry = self._handle_completed(f, item)
+                    if should_retry:
+                        retry_queue.append(item)
+                    elif self._item_completed_callback and item.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED):
+                        try:
+                            self._item_completed_callback(item)
+                        except Exception as e:
+                            logger.debug("任务完成回调异常: %s", e)
 
-                item.status = DownloadStatus.DOWNLOADING
-                with self._lock:
-                    self._report.active_items += 1
-                future = self._executor.submit(self._download_single, item)
-                futures[future] = item
-                item._future = future
+                while len(futures) < self._max_workers:
+                    next_item = None
+                    if retry_queue:
+                        next_item = retry_queue.pop(0)
+                    elif item_index < len(all_items):
+                        candidate = all_items[item_index]
+                        item_index += 1
+                        if candidate.status in (DownloadStatus.QUEUED, DownloadStatus.PENDING, DownloadStatus.FAILED):
+                            next_item = candidate
 
-            for future, item in list(futures.items()):
-                future.result()
-                self._handle_completed(future, item)
+                    if next_item is None:
+                        break
+
+                    if next_item.status in (DownloadStatus.FAILED, DownloadStatus.CANCELLED) and next_item.retry_count >= MAX_RETRIES:
+                        continue
+
+                    next_item.status = DownloadStatus.DOWNLOADING
+                    next_item.downloaded = 0
+                    with self._lock:
+                        self._report.active_items += 1
+                    future = self._executor.submit(self._download_single, next_item)
+                    futures[future] = next_item
+                    next_item._future = future
+
+                no_more_work = (
+                    not futures
+                    and not retry_queue
+                    and item_index >= len(all_items)
+                    and not self._new_items_event.is_set()
+                )
+
+                if no_more_work:
+                    recent_done = [f for f in futures if f.done()]
+                    if not recent_done and not futures:
+                        break
+
+                self._new_items_event.wait(timeout=0.05)
+                self._new_items_event.clear()
 
         except Exception as e:
             logger.error("下载队列异常: %s", e)
@@ -388,13 +452,18 @@ class DownloadQueue:
             with self._lock:
                 self._report.active_items = max(0, self._report.active_items - 1)
 
-    def _handle_completed(self, future: Future, item: DownloadItem) -> None:
-        """处理单个下载完成。"""
+    def _handle_completed(self, future: Future, item: DownloadItem) -> bool:
+        """处理单个下载完成。
+
+        Returns:
+            True 表示需要重试
+        """
         try:
             future.result()
         except Exception:
             pass
 
+        should_retry = False
         with self._lock:
             if item.status == DownloadStatus.COMPLETED:
                 self._report.completed_files += 1
@@ -403,12 +472,29 @@ class DownloadQueue:
                 self._report.skipped_files += 1
                 self._report.downloaded_size += item.size
             elif item.status == DownloadStatus.FAILED:
-                self._report.failed_files += 1
+                if item.retry_count < MAX_RETRIES:
+                    item.retry_count += 1
+                    item.status = DownloadStatus.QUEUED
+                    should_retry = True
+                    logger.warning(
+                        "下载失败，正在重试 (%d/%d): %s - %s",
+                        item.retry_count, MAX_RETRIES,
+                        item.tag or item.path.name, item.error
+                    )
+                    time.sleep(1)
+                else:
+                    self._report.failed_files += 1
+                    logger.error(
+                        "下载失败，已达最大重试次数 (%d): %s - %s",
+                        MAX_RETRIES, item.tag or item.path.name, item.error
+                    )
             elif item.status == DownloadStatus.CANCELLED:
                 self._report.cancelled_files += 1
 
         if self._progress_callback:
             self._progress_callback(self._report)
+
+        return should_retry
 
     def _calc_total_downloaded(self) -> int:
         """计算总已下载字节数。"""
@@ -438,11 +524,25 @@ class VersionDownloader:
         self._config = get_config()
         self._game_dir = game_dir or Path(self._config.get("game_directory", ".minecraft"))
         self._max_workers = max_workers or self._config.get("download.max_threads", 4)
+        self._pending_assets_meta: Optional[VersionMetadata] = None
+        self._assets_added = False
         self._queue = DownloadQueue(
             max_workers=self._max_workers,
             client=client,
             max_speed=max_speed,
+            item_completed_callback=self._on_item_completed,
         )
+
+    def _on_item_completed(self, item: DownloadItem) -> None:
+        """单个下载项完成时的回调，用于在 asset_index 下载完成后添加资源任务。"""
+        if item.tag == "asset_index" and item.status == DownloadStatus.COMPLETED:
+            if self._pending_assets_meta and not self._assets_added:
+                self._assets_added = True
+                logger.info("资源索引下载完成，正在添加资源文件任务...")
+                try:
+                    self.add_asset_tasks(item.path)
+                except Exception as e:
+                    logger.error("添加资源任务失败: %s", e)
 
     @property
     def queue(self) -> DownloadQueue:
@@ -454,61 +554,163 @@ class VersionDownloader:
     def set_speed_limit(self, bytes_per_second: float) -> None:
         self._queue.set_speed_limit(bytes_per_second)
 
-    def download_version(
+    def add_version_tasks(
         self,
         meta: VersionMetadata,
         include_client: bool = True,
+        include_server: bool = False,
         include_libraries: bool = True,
         include_natives: bool = True,
-    ) -> bool:
-        """下载版本所需的文件。
+        include_asset_index: bool = True,
+    ) -> list[DownloadItem]:
+        """添加版本所需的下载任务到队列，但不启动。
 
         Args:
             meta: 版本元数据
             include_client: 是否下载客户端 jar
+            include_server: 是否下载服务端 jar
             include_libraries: 是否下载库文件
             include_natives: 是否下载 native 库
+            include_asset_index: 是否下载资源索引
+
+        Returns:
+            添加的任务列表
+        """
+        tasks = self._collect_tasks(
+            meta,
+            include_client=include_client,
+            include_server=include_server,
+            include_libraries=include_libraries,
+            include_natives=include_natives,
+            include_asset_index=include_asset_index,
+        )
+        self._queue.add_items(tasks)
+        return tasks
+
+    def add_asset_tasks(self, asset_index_path: Path) -> list[DownloadItem]:
+        """根据已下载的资源索引添加资源文件下载任务。
+
+        Args:
+            asset_index_path: 资源索引文件路径
+
+        Returns:
+            添加的任务列表
+        """
+        import json
+        tasks: list[DownloadItem] = []
+
+        try:
+            from src.version.asset_manager import AssetIndex, RESOURCES_URL
+            index = AssetIndex.from_file(asset_index_path)
+            if index is None:
+                return tasks
+
+            objects_dir = self._game_dir / "assets" / "objects"
+            for path_str, obj in index.objects.items():
+                obj_path = objects_dir / obj.hash_prefix / obj.hash
+                if not (file_exists(obj_path) and obj.size > 0 and obj_path.stat().st_size == obj.size):
+                    url = f"{RESOURCES_URL}{obj.object_path}"
+                    tasks.append(DownloadItem(
+                        url=url,
+                        path=obj_path,
+                        sha1=obj.hash,
+                        size=obj.size,
+                        tag=f"asset:{path_str}",
+                        priority=10,
+                    ))
+
+            logger.info("添加了 %d 个资源文件下载任务", len(tasks))
+            self._queue.add_items(tasks)
+        except Exception as e:
+            logger.error("添加资源下载任务失败: %s", e)
+
+        return tasks
+
+    def start_and_wait(self) -> bool:
+        """启动队列并等待完成。
 
         Returns:
             True 表示全部成功
         """
-        self._queue.add_items(self._collect_tasks(
-            meta,
-            include_client=include_client,
-            include_libraries=include_libraries,
-            include_natives=include_natives,
-        ))
-        self._queue.start()
+        if not self._queue.is_running:
+            self._queue.start()
         self._queue.wait_completion()
         return self._queue.report.failed_files == 0 and not self._queue.is_paused
 
+    def download_version(
+        self,
+        meta: VersionMetadata,
+        include_client: bool = True,
+        include_server: bool = False,
+        include_libraries: bool = True,
+        include_natives: bool = True,
+        include_assets: bool = True,
+    ) -> bool:
+        """下载版本所需的全部文件（一站式）。
+
+        Args:
+            meta: 版本元数据
+            include_client: 是否下载客户端 jar
+            include_server: 是否下载服务端 jar
+            include_libraries: 是否下载库文件
+            include_natives: 是否下载 native 库
+            include_assets: 是否下载资源文件
+
+        Returns:
+            True 表示全部成功
+        """
+        self._pending_assets_meta = meta if include_assets else None
+        self._assets_added = False
+
+        self.add_version_tasks(
+            meta,
+            include_client=include_client,
+            include_server=include_server,
+            include_libraries=include_libraries,
+            include_natives=include_natives,
+            include_asset_index=include_assets,
+        )
+
+        if include_assets and meta.assets and meta.asset_index.url:
+            index_path = self._game_dir / "assets" / "indexes" / f"{meta.assets}.json"
+            if file_exists(index_path) and meta.asset_index.sha1 and verify_sha1(index_path, meta.asset_index.sha1):
+                logger.debug("资源索引已存在，直接添加资源任务: %s", index_path)
+                self._assets_added = True
+                self.add_asset_tasks(index_path)
+
+        return self.start_and_wait()
+
+    def _ensure_asset_index(self, meta: VersionMetadata) -> Optional[Path]:
+        """确保资源索引文件存在，必要时下载。"""
+        import json
+        assets_dir = self._game_dir / "assets" / "indexes"
+        ensure_directory(assets_dir)
+        index_path = assets_dir / f"{meta.assets}.json"
+
+        if file_exists(index_path) and meta.asset_index.sha1:
+            if verify_sha1(index_path, meta.asset_index.sha1):
+                return index_path
+
+        logger.info("下载资源索引: %s", meta.assets)
+        try:
+            data = self._queue._client.get_json(meta.asset_index.url)
+            write_json(index_path, data)
+            if meta.asset_index.sha1:
+                if not verify_sha1(index_path, meta.asset_index.sha1):
+                    logger.warning("资源索引校验失败")
+            return index_path
+        except Exception as e:
+            logger.error("下载资源索引失败: %s", e)
+            return None
+
     def download_client_jar(self, meta: VersionMetadata) -> bool:
         """仅下载客户端 jar。"""
-        version_dir = self._game_dir / "versions" / meta.id
-        ensure_directory(version_dir)
-        jar_path = version_dir / f"{meta.id}.jar"
-
-        if file_exists(jar_path) and meta.client_download.sha1:
-            if verify_sha1(jar_path, meta.client_download.sha1):
-                logger.debug("客户端 jar 已存在: %s", jar_path)
-                return True
-
-        if not meta.client_download.url:
-            logger.error("客户端 jar URL 为空")
-            return False
-
-        item = DownloadItem(
-            url=meta.client_download.url,
-            path=jar_path,
-            sha1=meta.client_download.sha1,
-            size=meta.client_download.size,
-            tag="client",
-            priority=100,
-        )
-        self._queue.add_item(item)
-        self._queue.start()
-        self._queue.wait_completion()
-        return item.status == DownloadStatus.COMPLETED
+        tasks = self._collect_tasks(meta, include_client=True, include_libraries=False, include_natives=False)
+        if not tasks:
+            logger.debug("客户端 jar 已存在")
+            return True
+        self._queue.add_items(tasks)
+        return self.start_and_wait()
 
     def download_asset_index(self, meta: VersionMetadata) -> Optional[Path]:
         """下载资源索引文件。
@@ -516,47 +718,39 @@ class VersionDownloader:
         Returns:
             索引文件路径，失败返回 None
         """
-        assets_dir = self._game_dir / "assets" / "indexes"
-        ensure_directory(assets_dir)
-        index_path = assets_dir / f"{meta.assets}.json"
-
-        if file_exists(index_path) and meta.asset_index.sha1:
-            if verify_sha1(index_path, meta.asset_index.sha1):
-                logger.debug("资源索引已存在: %s", index_path)
+        tasks = self._collect_tasks(meta, include_client=False, include_libraries=False,
+                                     include_natives=False, include_asset_index=True)
+        if not tasks:
+            assets_dir = self._game_dir / "assets" / "indexes"
+            index_path = assets_dir / f"{meta.assets}.json"
+            if file_exists(index_path):
                 return index_path
-
-        if not meta.asset_index.url:
-            logger.warning("资源索引 URL 为空")
             return None
 
-        item = DownloadItem(
-            url=meta.asset_index.url,
-            path=index_path,
-            sha1=meta.asset_index.sha1,
-            size=meta.asset_index.size,
-            tag="asset_index",
-            priority=90,
-        )
-        self._queue.add_item(item)
-        self._queue.start()
-        self._queue.wait_completion()
-        return index_path if item.status == DownloadStatus.COMPLETED else None
+        self._queue.add_items(tasks)
+        if self.start_and_wait():
+            assets_dir = self._game_dir / "assets" / "indexes"
+            return assets_dir / f"{meta.assets}.json"
+        return None
 
     def _collect_tasks(
         self,
         meta: VersionMetadata,
         include_client: bool = True,
+        include_server: bool = False,
         include_libraries: bool = True,
         include_natives: bool = True,
+        include_asset_index: bool = True,
     ) -> list[DownloadItem]:
         """收集下载任务列表。"""
         tasks: list[DownloadItem] = []
         libraries_dir = self._game_dir / "libraries"
         os_name = _get_os_name()
 
-        # 客户端 jar
+        version_dir = self._game_dir / "versions" / meta.id
+        ensure_directory(version_dir)
+
         if include_client and meta.client_download.url:
-            version_dir = self._game_dir / "versions" / meta.id
             jar_path = version_dir / f"{meta.id}.jar"
             if not (file_exists(jar_path) and meta.client_download.sha1 and verify_sha1(jar_path, meta.client_download.sha1)):
                 tasks.append(DownloadItem(
@@ -568,7 +762,34 @@ class VersionDownloader:
                     priority=100,
                 ))
 
-        # 库文件和 natives
+        if include_server and meta.server_download and meta.server_download.url:
+            server_path = version_dir / f"{meta.id}-server.jar"
+            if not (file_exists(server_path) and meta.server_download.sha1 and
+                    verify_sha1(server_path, meta.server_download.sha1)):
+                tasks.append(DownloadItem(
+                    url=meta.server_download.url,
+                    path=server_path,
+                    sha1=meta.server_download.sha1,
+                    size=meta.server_download.size,
+                    tag="server",
+                    priority=95,
+                ))
+
+        if include_asset_index and meta.asset_index.url and meta.assets:
+            assets_dir = self._game_dir / "assets" / "indexes"
+            ensure_directory(assets_dir)
+            index_path = assets_dir / f"{meta.assets}.json"
+            if not (file_exists(index_path) and meta.asset_index.sha1 and
+                    verify_sha1(index_path, meta.asset_index.sha1)):
+                tasks.append(DownloadItem(
+                    url=meta.asset_index.url,
+                    path=index_path,
+                    sha1=meta.asset_index.sha1,
+                    size=meta.asset_index.size,
+                    tag="asset_index",
+                    priority=90,
+                ))
+
         if include_libraries:
             for lib in meta.libraries:
                 if not lib.matches_os(os_name):
@@ -579,6 +800,7 @@ class VersionDownloader:
                     cls_dl = lib.downloads.classifiers.get(classifier_name)
                     if cls_dl and cls_dl.url:
                         path = libraries_dir / (cls_dl.path or _build_maven_path(lib, classifier_name))
+                        ensure_directory(path.parent)
                         if not (file_exists(path) and cls_dl.sha1 and verify_sha1(path, cls_dl.sha1)):
                             tasks.append(DownloadItem(
                                 url=cls_dl.url,
@@ -592,6 +814,7 @@ class VersionDownloader:
                     artifact = lib.downloads.artifact
                     if artifact and artifact.url:
                         path = libraries_dir / (artifact.path or _build_maven_path(lib))
+                        ensure_directory(path.parent)
                         if not (file_exists(path) and artifact.sha1 and verify_sha1(path, artifact.sha1)):
                             tasks.append(DownloadItem(
                                 url=artifact.url,

@@ -282,6 +282,7 @@ class VersionManager:
         version_id: str,
         progress_callback: Optional[Callable[[DownloadReport], None]] = None,
         include_assets: bool = True,
+        include_server: bool = False,
     ) -> bool:
         """安装指定版本。
 
@@ -291,6 +292,7 @@ class VersionManager:
             version_id: 版本 ID
             progress_callback: 下载进度回调
             include_assets: 是否同时下载资源文件
+            include_server: 是否同时下载服务端 jar
 
         Returns:
             True 表示安装成功
@@ -322,16 +324,14 @@ class VersionManager:
         if progress_callback:
             downloader.set_progress_callback(progress_callback)
 
-        success = downloader.download_version(meta)
-
-        if success:
-            index_path = downloader.download_asset_index(meta)
-
-            if include_assets and index_path and meta.asset_index.url:
-                index = AssetIndex.from_file(index_path, meta.assets)
-                if index:
-                    logger.info("开始下载资源文件...")
-                    self._asset_manager.download_assets(index, only_missing=True)
+        success = downloader.download_version(
+            meta,
+            include_client=True,
+            include_server=include_server,
+            include_libraries=True,
+            include_natives=True,
+            include_assets=include_assets,
+        )
 
         self._downloader = None
 
