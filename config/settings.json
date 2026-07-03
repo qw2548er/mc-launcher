@@ -1,0 +1,42 @@
+{
+  "game_directory": "/tmp/tmpfwl4dng7",
+  "java_path": "",
+  "offline_username": "Steve",
+  "java_args": {
+    "min_memory_mb": 512,
+    "max_memory_mb": 4096,
+    "extra_args": "-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions"
+  },
+  "launch": {
+    "window_width": 854,
+    "window_height": 480,
+    "fullscreen": false,
+    "close_launcher": true
+  },
+  "download": {
+    "max_threads": 4,
+    "max_retries": 3
+  },
+  "appearance": {
+    "theme": "dark",
+    "language": "zh_CN",
+    "font_size": 12
+  },
+  "advanced": {
+    "auto_update_versions": true,
+    "keep_old_versions": false,
+    "show_snapshots": false,
+    "show_beta": false,
+    "show_alpha": false
+  },
+  "default_version": "",
+  "default_account": "",
+  "last_launch": {
+    "version": "1.20.4",
+    "time": "2026-07-03T17:53:27.481835",
+    "launch_count": 1
+  },
+  "auth": {
+    "ms_client_id": ""
+  }
+}
