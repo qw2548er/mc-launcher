@@ -141,6 +141,8 @@ def build(args: argparse.Namespace) -> bool:
         "src.core.java_detector",
         "src.core.account",
         "src.core.auth",
+        "src.core.bundled_jre",
+        "src.core.renderer",
         "src.core.server_manager",
         "src.core.server_ping",
         "src.core.skin_manager",

@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from src.core.account import AccountInfo
 from src.core.java_detector import JavaDetector, JavaInfo
+from src.core.renderer import generate_renderer_jvm_args, get_default_renderer_id
 from src.utils.config import ConfigManager, get_config
 from src.utils.logger import get_logger
 
@@ -129,6 +130,20 @@ class GameLauncher:
         demo_mode: bool = False,
         server_address: Optional[str] = None,
         server_port: Optional[int] = None,
+        version_isolation: bool = False,
+        renderer_id: Optional[str] = None,
+        renderer_big_core: bool = False,
+        use_system_vulkan: bool = False,
+        graphics_backend: Optional[str] = None,
+        vulkan_driver: Optional[str] = None,
+        skip_integrity_check: bool = False,
+        skip_jvm_check: bool = False,
+        skip_mod_check: bool = False,
+        debug_log: bool = False,
+        custom_game_args: str = "",
+        custom_jvm_args: str = "",
+        env_vars: str = "",
+        custom_uuid: str = "",
     ) -> subprocess.Popen:
         """启动 Minecraft 游戏。
 
@@ -166,17 +181,32 @@ class GameLauncher:
             game_dir = Path(self._config.get("game_directory", str(Path.home() / ".minecraft")))
         game_dir = game_dir.resolve()
 
+        if version_isolation:
+            game_dir = game_dir / "versions" / version_id / "isolated"
+            game_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("使用版本隔离目录: %s", game_dir)
+
+        if custom_uuid and account:
+            account.uuid = custom_uuid
+            if not account.is_microsoft:
+                import uuid as uuid_mod
+                account.uuid = str(uuid_mod.uuid3(uuid_mod.NAMESPACE_DNS, f"offline:{account.username}")) if not custom_uuid else custom_uuid
+
         if on_progress:
             on_progress("正在检查启动环境...")
 
-        check_result = self.pre_check(version_id, game_dir, java_path, max_memory_mb)
+        check_result = self.pre_check(
+            version_id, game_dir, java_path, max_memory_mb,
+            skip_jvm_check=skip_jvm_check,
+            skip_integrity_check=skip_integrity_check,
+        )
         if not check_result.can_launch:
             raise LaunchError(check_result.get_error_message())
 
         if on_progress:
             on_progress("正在准备启动参数...")
 
-        java_info = self._resolve_java(java_path, version_id)
+        java_info = self._resolve_java(java_path, version_id, skip_jvm_check=skip_jvm_check)
         version_dir = game_dir / "versions" / version_id
         version_json = self._load_version_json(version_dir)
         if version_json is None:
@@ -185,7 +215,8 @@ class GameLauncher:
         if on_progress:
             on_progress("正在验证版本文件...")
 
-        self._verify_version_files(version_dir, version_json)
+        if not skip_integrity_check:
+            self._verify_version_files(version_dir, version_json)
 
         if on_progress:
             on_progress("正在构建类路径...")
@@ -197,8 +228,22 @@ class GameLauncher:
 
         natives_dir = self._prepare_natives(game_dir, version_json)
 
+        if renderer_id is None:
+            renderer_id = self._config.get("renderer.selected", get_default_renderer_id())
+        if graphics_backend is None:
+            graphics_backend = self._config.get("graphics.backend", "gl4es")
+        if vulkan_driver is None:
+            vulkan_driver = self._config.get("vulkan.driver", "turnip")
+
         if on_progress:
             on_progress("正在组装 JVM 参数...")
+
+        merged_extra_jvm = extra_jvm_args or ""
+        if custom_jvm_args:
+            if merged_extra_jvm:
+                merged_extra_jvm += " " + custom_jvm_args
+            else:
+                merged_extra_jvm = custom_jvm_args
 
         jvm_args = self._build_jvm_args(
             java_info=java_info,
@@ -209,12 +254,19 @@ class GameLauncher:
             version_json=version_json,
             min_memory_mb=min_memory_mb,
             max_memory_mb=max_memory_mb,
-            extra_jvm_args=extra_jvm_args,
+            extra_jvm_args=merged_extra_jvm,
+            renderer_id=renderer_id,
+            renderer_big_core=renderer_big_core,
+            use_system_vulkan=use_system_vulkan,
+            graphics_backend=graphics_backend,
+            vulkan_driver=vulkan_driver,
+            debug_log=debug_log,
         )
 
         if on_progress:
             on_progress("正在组装游戏参数...")
 
+        merged_game_args = custom_game_args if custom_game_args else ""
         mc_args = self._build_minecraft_args(
             account=account,
             version_json=version_json,
@@ -225,21 +277,33 @@ class GameLauncher:
             demo_mode=demo_mode,
             server_address=server_address,
             server_port=server_port,
+            extra_game_args=merged_game_args,
         )
 
         main_class = version_json.get("mainClass", MAIN_CLASS)
         command = [str(java_info.path)] + jvm_args + [main_class] + mc_args
 
+        env = os.environ.copy()
+        if env_vars:
+            for pair in env_vars.split(";"):
+                pair = pair.strip()
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    env[k.strip()] = v.strip()
+
         logger.info("启动 Minecraft %s", version_id)
-        logger.debug("Java 路径: %s (版本 %d)", java_info.path, java_info.major_version)
-        logger.debug("游戏目录: %s", game_dir)
+        logger.info("Java 路径: %s (版本 %d, %s)", java_info.path, java_info.major_version, java_info.vendor)
+        logger.info("游戏目录: %s", game_dir)
+        logger.info("渲染器: %s (后端: %s)", renderer_id, graphics_backend)
+        if debug_log:
+            logger.debug("完整命令行: %s", " ".join(command))
         logger.debug("命令行长度: %d 个参数", len(command))
 
         if on_progress:
             on_progress("正在启动游戏进程...")
 
         self._setup_logging(game_dir, version_id)
-        self._process = self._start_process(command, game_dir)
+        self._process = self._start_process(command, game_dir, env=env)
         self._is_running = True
         self._start_log_thread()
         self._start_monitor_thread()
@@ -257,6 +321,8 @@ class GameLauncher:
         game_dir: Optional[Path] = None,
         java_path: Optional[Path] = None,
         max_memory_mb: Optional[int] = None,
+        skip_jvm_check: bool = False,
+        skip_integrity_check: bool = False,
     ) -> LaunchCheckResult:
         """启动前检查。
 
@@ -291,22 +357,30 @@ class GameLauncher:
             return result
 
         if not json_path.exists():
-            result.add_error(f"无法读取版本配置文件: {json_path}")
+            if not skip_integrity_check:
+                result.add_error(f"无法读取版本配置文件: {json_path}")
+            else:
+                result.add_warning(f"版本配置文件不存在（已跳过完整性检查）: {json_path}")
         else:
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
                     version_json = json.load(f)
             except (json.JSONDecodeError, OSError) as e:
-                result.add_error(f"无法读取版本配置文件: {e}")
+                if not skip_integrity_check:
+                    result.add_error(f"无法读取版本配置文件: {e}")
                 version_json = None
         if not jar_path.exists():
-            result.add_error(f"版本 jar 文件不存在: {jar_path}")
+            if not skip_integrity_check:
+                result.add_error(f"版本 jar 文件不存在: {jar_path}")
+            else:
+                result.add_warning(f"版本 jar 文件不存在（已跳过完整性检查）: {jar_path}")
 
         java_info = None
         if java_path:
             java_info = self._java_detector.check_java(java_path)
             if java_info is None:
-                result.add_error(f"指定的 Java 路径无效: {java_path}")
+                if not skip_jvm_check:
+                    result.add_error(f"指定的 Java 路径无效: {java_path}")
         else:
             config_java = self._config.get("java_path", "")
             if config_java:
@@ -315,12 +389,15 @@ class GameLauncher:
                 java_info = self._java_detector.get_best_match(version_id)
 
         if java_info is None:
-            result.add_error(
-                "未找到可用的 Java 运行环境。\n"
-                "请安装 Java 或在设置中手动指定 Java 路径。"
-            )
+            if not skip_jvm_check:
+                result.add_error(
+                    "未找到可用的 Java 运行环境。\n"
+                    "请安装 Java 或在设置中手动指定 Java 路径。"
+                )
+            else:
+                result.add_warning("未找到 Java（已跳过 JVM 检查）")
         else:
-            if not self._java_detector.is_compatible(java_info, version_id):
+            if not skip_jvm_check and not self._java_detector.is_compatible(java_info, version_id):
                 min_java = self._java_detector._get_min_java_version(version_id)
                 result.add_error(
                     f"Java {java_info.major_version} 不兼容 Minecraft {version_id}。\n"
@@ -422,7 +499,7 @@ class GameLauncher:
             pass
         return 0.0
 
-    def _resolve_java(self, java_path: Optional[Path], version_id: str) -> JavaInfo:
+    def _resolve_java(self, java_path: Optional[Path], version_id: str, skip_jvm_check: bool = False) -> JavaInfo:
         if java_path:
             java_info = self._java_detector.check_java(java_path)
             if java_info is None:
@@ -440,7 +517,7 @@ class GameLauncher:
                 "未找到可用的 Java 运行环境。请安装 Java 或在设置中手动指定路径。"
             )
 
-        if not self._java_detector.is_compatible(java_info, version_id):
+        if not skip_jvm_check and not self._java_detector.is_compatible(java_info, version_id):
             min_java = self._java_detector._get_min_java_version(version_id)
             raise LaunchError(
                 f"Java {java_info.major_version} 不兼容 Minecraft {version_id}。"
@@ -566,6 +643,12 @@ class GameLauncher:
         min_memory_mb: Optional[int] = None,
         max_memory_mb: Optional[int] = None,
         extra_jvm_args: Optional[str] = None,
+        renderer_id: Optional[str] = None,
+        renderer_big_core: bool = False,
+        use_system_vulkan: bool = False,
+        graphics_backend: str = "gl4es",
+        vulkan_driver: str = "turnip",
+        debug_log: bool = False,
     ) -> list[str]:
         config = get_config()
 
@@ -585,6 +668,20 @@ class GameLauncher:
             extra_jvm_args = config.get("java_args.extra_args", "")
         if extra_jvm_args:
             args.extend(extra_jvm_args.split())
+
+        if renderer_id:
+            renderer_args = generate_renderer_jvm_args(
+                renderer_id=renderer_id,
+                big_core=renderer_big_core,
+                use_system_vulkan=use_system_vulkan,
+                graphics_backend=graphics_backend,
+                vulkan_driver=vulkan_driver,
+            )
+            args.extend(renderer_args)
+
+        if debug_log:
+            args.append("-Dminecraft.debug.logging=true")
+            args.append("-Dorg.lwjgl.util.Debug=true")
 
         if sys.platform == "darwin":
             args.append("-XstartOnFirstThread")
@@ -636,6 +733,7 @@ class GameLauncher:
         demo_mode: bool = False,
         server_address: Optional[str] = None,
         server_port: Optional[int] = None,
+        extra_game_args: str = "",
     ) -> list[str]:
         config = get_config()
 
@@ -726,6 +824,10 @@ class GameLauncher:
                 extra_parts.append(p)
             args.extend(extra_parts)
 
+        if extra_game_args:
+            extra_parts_list = extra_game_args.split()
+            args.extend(extra_parts_list)
+
         return args
 
     def _setup_logging(self, game_dir: Path, version_id: str) -> None:
@@ -741,6 +843,7 @@ class GameLauncher:
         self,
         command: list[str],
         game_dir: Path,
+        env: Optional[dict] = None,
     ) -> subprocess.Popen:
         try:
             creationflags = 0
@@ -750,6 +853,7 @@ class GameLauncher:
             process = subprocess.Popen(
                 command,
                 cwd=str(game_dir),
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,

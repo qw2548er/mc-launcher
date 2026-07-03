@@ -154,6 +154,8 @@ class JavaDetector:
         self._java_list.clear()
         found_paths: set[Path] = set()
 
+        self._scan_bundled_jres(found_paths)
+
         path_java = self._find_in_path()
         if path_java and path_java not in found_paths:
             info = self._parse_java_info(path_java)
@@ -239,8 +241,12 @@ class JavaDetector:
         if not self._scanned:
             self.scan()
 
+        bundled = self._get_best_bundled_jre(mc_version)
+        if bundled:
+            return bundled
+
         for java in self._java_list:
-            if java.major_version >= min_java and java.is_64bit:
+            if java.major_version >= min_java and java.is_64bit and not self._is_bundled_path(java.path):
                 logger.info(
                     "为 MC %s 选择 Java %d (%s): %s",
                     mc_version,
@@ -251,7 +257,7 @@ class JavaDetector:
                 return java
 
         for java in self._java_list:
-            if java.major_version >= min_java:
+            if java.major_version >= min_java and not self._is_bundled_path(java.path):
                 logger.info(
                     "为 MC %s 选择 Java %d (%s): %s",
                     mc_version,
@@ -259,6 +265,14 @@ class JavaDetector:
                     java.vendor,
                     java.path,
                 )
+                return java
+
+        for java in self._java_list:
+            if java.major_version >= min_java and java.is_64bit:
+                return java
+
+        for java in self._java_list:
+            if java.major_version >= min_java:
                 return java
 
         logger.warning("未找到满足 MC %s 要求的 Java (需要 >= %d)", mc_version, min_java)
@@ -326,6 +340,55 @@ class JavaDetector:
     @staticmethod
     def get_required_java_version(mc_version: str) -> int:
         return JavaDetector._get_min_java_version(mc_version)
+
+    def _scan_bundled_jres(self, found_paths: set[Path]) -> None:
+        try:
+            from src.core.bundled_jre import get_bundled_jre_manager
+            mgr = get_bundled_jre_manager()
+            for jre_info in mgr.get_installed_jres():
+                if jre_info.java_exe and jre_info.java_exe not in found_paths:
+                    info = self._parse_java_info(jre_info.java_exe)
+                    if info and info.is_valid:
+                        info.vendor = "内置 JRE"
+                        self._java_list.append(info)
+                        found_paths.add(jre_info.java_exe)
+                        logger.debug("内置 JRE 已加载: %s -> %s", jre_info.jre_id, jre_info.java_exe)
+        except Exception as e:
+            logger.debug("扫描内置 JRE 失败: %s", e)
+
+    def _get_best_bundled_jre(self, mc_version: str) -> Optional[JavaInfo]:
+        try:
+            from src.core.bundled_jre import get_bundled_jre_manager
+            mgr = get_bundled_jre_manager()
+            best = mgr.get_best_jre_for_version(mc_version)
+            if best and best.java_exe:
+                for java in self._java_list:
+                    if java.path == best.java_exe:
+                        logger.info(
+                            "为 MC %s 优先选择内置 JRE %d: %s",
+                            mc_version, best.major_version, best.java_exe,
+                        )
+                        return java
+                info = self.check_java(best.java_exe)
+                if info:
+                    info.vendor = "内置 JRE"
+                    return info
+        except Exception as e:
+            logger.debug("获取最佳内置 JRE 失败: %s", e)
+        return None
+
+    @staticmethod
+    def _is_bundled_path(path: Path) -> bool:
+        try:
+            from src.core.bundled_jre import get_bundle_jre_dir
+            jre_dir = get_bundle_jre_dir()
+            try:
+                path.resolve().relative_to(jre_dir.resolve())
+                return True
+            except ValueError:
+                return False
+        except Exception:
+            return False
 
     def _get_search_paths(self) -> list[str]:
         if sys.platform == "win32":

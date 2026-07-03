@@ -137,6 +137,7 @@ class LaunchThread(QThread):
     launch_log = pyqtSignal(str, str)
     launch_finished = pyqtSignal(bool, str)
     game_exited = pyqtSignal(int)
+    java_info_ready = pyqtSignal(str, int)
 
     def __init__(
         self,
@@ -149,6 +150,23 @@ class LaunchThread(QThread):
         account=None,
         server_address: str = "",
         server_port: int = 0,
+        version_isolation: bool = False,
+        renderer_id: str = "",
+        renderer_big_core: bool = False,
+        use_system_vulkan: bool = False,
+        graphics_backend: str = "",
+        vulkan_driver: str = "",
+        skip_integrity_check: bool = False,
+        skip_jvm_check: bool = False,
+        skip_mod_check: bool = False,
+        debug_log: bool = False,
+        custom_game_args: str = "",
+        custom_jvm_args: str = "",
+        env_vars: str = "",
+        custom_uuid: str = "",
+        window_width: int = 0,
+        window_height: int = 0,
+        fullscreen: bool = False,
     ):
         super().__init__()
         self._version_id = version_id
@@ -160,6 +178,23 @@ class LaunchThread(QThread):
         self._account = account
         self._server_address = server_address
         self._server_port = server_port
+        self._version_isolation = version_isolation
+        self._renderer_id = renderer_id
+        self._renderer_big_core = renderer_big_core
+        self._use_system_vulkan = use_system_vulkan
+        self._graphics_backend = graphics_backend
+        self._vulkan_driver = vulkan_driver
+        self._skip_integrity_check = skip_integrity_check
+        self._skip_jvm_check = skip_jvm_check
+        self._skip_mod_check = skip_mod_check
+        self._debug_log = debug_log
+        self._custom_game_args = custom_game_args
+        self._custom_jvm_args = custom_jvm_args
+        self._env_vars = env_vars
+        self._custom_uuid = custom_uuid
+        self._window_width = window_width if window_width > 0 else None
+        self._window_height = window_height if window_height > 0 else None
+        self._fullscreen = fullscreen
         self._launcher = None
         self._cancel = False
 
@@ -191,8 +226,15 @@ class LaunchThread(QThread):
                 )
 
             java_path = None
+            java_major = 0
+            java_vendor = ""
             if self._java_path:
                 java_path = Path(self._java_path)
+                detector = JavaDetector()
+                info = detector.check_java(java_path)
+                if info:
+                    java_major = info.major_version
+                    java_vendor = info.vendor
                 self.launch_progress.emit(f"使用指定的 Java: {java_path}")
             else:
                 self.launch_progress.emit("正在自动检测合适的 Java...")
@@ -200,10 +242,18 @@ class LaunchThread(QThread):
                 best_java = detector.get_best_match(self._version_id)
                 if best_java:
                     java_path = best_java.path
+                    java_major = best_java.major_version
+                    java_vendor = best_java.vendor
                     self.launch_progress.emit(f"自动选择 Java {best_java.major_version} ({best_java.vendor})")
                 else:
                     required_ver = JavaDetector.get_required_java_version(self._version_id)
-                    raise LaunchError(f"未找到 Java {required_ver} 或更高版本。\n请安装 Java {required_ver} 后重试，或手动指定 Java 路径。")
+                    if self._skip_jvm_check:
+                        self.launch_progress.emit(f"警告: 未找到 Java，但已跳过 JVM 检查")
+                    else:
+                        raise LaunchError(f"未找到 Java {required_ver} 或更高版本。\n请安装 Java {required_ver} 后重试，或手动指定 Java 路径。")
+
+            if java_major > 0:
+                self.java_info_ready.emit(java_vendor or "Java", java_major)
 
             def on_log(line: str, level: str):
                 self.launch_log.emit(line, level)
@@ -221,7 +271,9 @@ class LaunchThread(QThread):
                 self._version_id,
                 game_dir=self._game_dir,
                 java_path=java_path,
-                max_memory_mb=max_mem_mb
+                max_memory_mb=max_mem_mb,
+                skip_jvm_check=self._skip_jvm_check,
+                skip_integrity_check=self._skip_integrity_check,
             )
 
             if not check_result.can_launch:
@@ -249,6 +301,23 @@ class LaunchThread(QThread):
                 extra_jvm_args=self._extra_jvm_args if self._extra_jvm_args else None,
                 server_address=self._server_address if self._server_address else None,
                 server_port=self._server_port if self._server_port else None,
+                version_isolation=self._version_isolation,
+                renderer_id=self._renderer_id if self._renderer_id else None,
+                renderer_big_core=self._renderer_big_core,
+                use_system_vulkan=self._use_system_vulkan,
+                graphics_backend=self._graphics_backend if self._graphics_backend else None,
+                vulkan_driver=self._vulkan_driver if self._vulkan_driver else None,
+                skip_integrity_check=self._skip_integrity_check,
+                skip_jvm_check=self._skip_jvm_check,
+                skip_mod_check=self._skip_mod_check,
+                debug_log=self._debug_log,
+                custom_game_args=self._custom_game_args,
+                custom_jvm_args=self._custom_jvm_args,
+                env_vars=self._env_vars,
+                custom_uuid=self._custom_uuid,
+                window_width=self._window_width,
+                window_height=self._window_height,
+                fullscreen=self._fullscreen,
             )
 
             self.launch_finished.emit(True, "")
@@ -1116,6 +1185,36 @@ class MainWindow(QMainWindow):
 
         max_memory_gb = self._memory_slider.value()
 
+        server_address = config.get("game.server_address", "")
+        server_port = 0
+        if server_address and ":" in server_address:
+            parts = server_address.split(":", 1)
+            server_address = parts[0]
+            try:
+                server_port = int(parts[1])
+            except ValueError:
+                server_port = 0
+
+        version_isolation = config.get("game.version_isolation", False)
+        renderer_id = config.get("renderer.selected", "")
+        renderer_big_core = config.get("renderer.big_core", False)
+        use_system_vulkan = config.get("vulkan.use_system", False)
+        graphics_backend = config.get("graphics.backend", "")
+        vulkan_driver = config.get("vulkan.driver", "")
+        skip_integrity_check = config.get("debug.skip_integrity", False)
+        skip_jvm_check = config.get("debug.skip_jvm_check", False)
+        skip_mod_check = config.get("debug.skip_mod_check", False)
+        debug_log = config.get("debug.log_enabled", False)
+        custom_game_args = config.get("advanced.game_args", "")
+        custom_jvm_args = config.get("advanced.extra_jvm_args", "")
+        env_vars = config.get("advanced.env_vars", "")
+        custom_uuid = config.get("advanced.custom_uuid", "")
+
+        force_resolution = config.get("launch.force_resolution", False)
+        window_width = config.get("launch.window_width", 854) if force_resolution else 0
+        window_height = config.get("launch.window_height", 480) if force_resolution else 0
+        fullscreen = config.get("launch.fullscreen", False)
+
         self._is_launching = True
         self._launch_btn.setEnabled(False)
         self._launch_btn.setText(self.tr("启动中..."))
@@ -1136,13 +1235,36 @@ class MainWindow(QMainWindow):
             game_dir=game_dir,
             max_memory_gb=max_memory_gb,
             account=account,
+            server_address=server_address,
+            server_port=server_port,
+            version_isolation=version_isolation,
+            renderer_id=renderer_id,
+            renderer_big_core=renderer_big_core,
+            use_system_vulkan=use_system_vulkan,
+            graphics_backend=graphics_backend,
+            vulkan_driver=vulkan_driver,
+            skip_integrity_check=skip_integrity_check,
+            skip_jvm_check=skip_jvm_check,
+            skip_mod_check=skip_mod_check,
+            debug_log=debug_log,
+            custom_game_args=custom_game_args,
+            custom_jvm_args=custom_jvm_args,
+            env_vars=env_vars,
+            custom_uuid=custom_uuid,
+            window_width=window_width,
+            window_height=window_height,
+            fullscreen=fullscreen,
         )
         self._launch_thread.launch_started.connect(self._on_launch_started)
         self._launch_thread.launch_progress.connect(self._on_launch_progress)
         self._launch_thread.launch_log.connect(self._on_launch_log)
         self._launch_thread.launch_finished.connect(self._on_launch_finished)
         self._launch_thread.game_exited.connect(self._on_game_exited)
+        self._launch_thread.java_info_ready.connect(self._on_java_info_ready)
         self._launch_thread.start()
+
+    def _on_java_info_ready(self, vendor: str, major_version: int):
+        self.set_java_status(f"{major_version} ({vendor.split()[0]})")
 
     def _on_launch_started(self):
         pass
@@ -1629,8 +1751,14 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         from .settings_dialog import SettingsDialog
-        dialog = SettingsDialog(self)
+        dialog = SettingsDialog(self, mc_version=self._selected_version or "")
+        dialog.settings_changed.connect(self._on_settings_changed)
         dialog.exec()
+
+    def _on_settings_changed(self, settings: dict):
+        self._init_launcher()
+        if self._selected_version:
+            self._check_java_compatibility()
 
     def _open_accounts(self) -> None:
         from .account_dialog import AccountDialog

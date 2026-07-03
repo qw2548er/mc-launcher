@@ -287,13 +287,13 @@ class AccountManager:
 
     def update_token(
         self,
-        uuid: str,
+        account_uuid: str,
         access_token: str,
         refresh_token: str,
         expires_in: int = 86400,
     ) -> bool:
         return self.update_microsoft_account(
-            uuid,
+            account_uuid,
             access_token=access_token,
             refresh_token=refresh_token,
             expires_in=expires_in,
