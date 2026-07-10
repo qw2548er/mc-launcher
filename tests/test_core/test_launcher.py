@@ -182,14 +182,88 @@ class TestGameLauncher:
             assert result["id"] == "1.20.4"
 
     def test_load_version_json_invalid(self, launcher):
-        """测试加载无效 JSON。"""
+        """测试加载无效 JSON 应抛出 LaunchError。"""
         with tempfile.TemporaryDirectory() as tmpdir:
             version_dir = Path(tmpdir)
             with open(version_dir / "version.json", "w") as f:
                 f.write("invalid json")
 
-            result = GameLauncher._load_version_json(version_dir)
-            assert result is None
+            with pytest.raises(LaunchError, match="版本配置文件"):
+                GameLauncher._load_version_json(version_dir)
+
+    def test_validate_version_json_structure_valid(self, launcher):
+        """测试校验有效的版本 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "1.20.4.json"
+            data = {"id": "1.20.4", "mainClass": "net.minecraft.client.main.Main", "libraries": []}
+            json_path.write_text(json.dumps(data))
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is True
+            assert msg == ""
+
+    def test_validate_version_json_structure_empty(self, launcher):
+        """测试校验空文件。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "empty.json"
+            json_path.write_text("")
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is False
+            assert "为空" in msg
+
+    def test_validate_version_json_structure_html(self, launcher):
+        """测试校验 HTML 内容（下载失败场景）。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "1.7.10.json"
+            json_path.write_text("<!DOCTYPE html><html><body>404 Not Found</body></html>")
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is False
+            assert "HTML" in msg
+
+    def test_validate_version_json_structure_not_json(self, launcher):
+        """测试校验非 JSON 对象内容。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "test.json"
+            json_path.write_text("hello world this is not json")
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is False
+            assert "格式错误" in msg
+
+    def test_validate_version_json_structure_missing_fields(self, launcher):
+        """测试校验缺少必要字段的 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "test.json"
+            json_path.write_text('{"id": "1.20.4"}')
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is False
+            assert "缺少必要字段" in msg
+
+    def test_repair_version_json(self, launcher):
+        """测试修复损坏的版本 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            game_dir = Path(tmpdir) / ".minecraft"
+            version_dir = game_dir / "versions" / "1.7.10"
+            version_dir.mkdir(parents=True)
+            json_path = version_dir / "1.7.10.json"
+            json_path.write_text("corrupted data")
+
+            assert json_path.exists()
+            result = GameLauncher.repair_version_json("1.7.10", game_dir)
+            assert result is True
+            assert not json_path.exists()
+            assert json_path.with_suffix(".json.corrupted").exists()
+
+    def test_repair_version_json_nonexistent(self, launcher):
+        """测试修复不存在的版本 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            game_dir = Path(tmpdir) / ".minecraft"
+            game_dir.mkdir()
+            result = GameLauncher.repair_version_json("nonexistent", game_dir)
+            assert result is False
 
     def test_build_jvm_args(self, launcher):
         """测试构建 JVM 参数。"""

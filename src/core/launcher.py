@@ -362,13 +362,21 @@ class GameLauncher:
             else:
                 result.add_warning(f"版本配置文件不存在（已跳过完整性检查）: {json_path}")
         else:
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    version_json = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                if not skip_integrity_check:
-                    result.add_error(f"无法读取版本配置文件: {e}")
-                version_json = None
+            if not skip_integrity_check:
+                valid, err_msg = self._validate_version_json_structure(json_path)
+                if not valid:
+                    result.add_error(err_msg)
+                    result.add_error(
+                        "请点击「修复版本」重新下载版本配置文件，"
+                        "或删除以下文件后重新安装版本:\n"
+                        f"  {json_path}"
+                    )
+            else:
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        json.load(f)
+                except (json.JSONDecodeError, OSError) as e:
+                    result.add_warning(f"版本配置文件可能损坏（已跳过完整性检查）: {e}")
         if not jar_path.exists():
             if not skip_integrity_check:
                 result.add_error(f"版本 jar 文件不存在: {jar_path}")
@@ -538,10 +546,105 @@ class GameLauncher:
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = f.read()
+            if not raw.strip():
+                raise LaunchError(
+                    f"版本配置文件为空: {json_path}\n"
+                    "请点击「修复版本」重新下载，或删除该文件后重新安装版本。"
+                )
+            if not raw.strip().startswith("{"):
+                raise LaunchError(
+                    f"版本配置文件格式错误（非JSON对象）: {json_path}\n"
+                    "文件可能已损坏，请点击「修复版本」重新下载。"
+                )
+            return json.loads(raw)
         except (json.JSONDecodeError, OSError) as e:
-            logger.error("解析 version.json 失败: %s", e)
-            return None
+            raise LaunchError(
+                f"版本配置文件损坏或无法解析: {json_path}\n"
+                f"错误详情: {e}\n"
+                "请点击「修复版本」重新下载该版本。"
+            )
+
+    @staticmethod
+    def _validate_version_json_structure(json_path: Path) -> tuple[bool, str]:
+        """深度校验版本 JSON 文件结构合法性。
+
+        检测常见损坏模式：空文件、HTML错误页、无关键字段、格式错误。
+
+        Returns:
+            (is_valid, error_message)
+        """
+        if not json_path.exists():
+            return False, f"文件不存在: {json_path}"
+
+        file_size = json_path.stat().st_size
+        if file_size == 0:
+            return False, f"版本配置文件为空: {json_path}"
+
+        try:
+            raw = json_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return False, f"版本配置文件编码错误，文件可能已损坏: {json_path}"
+
+        stripped = raw.strip()
+        if not stripped.startswith("{"):
+            # 检测常见非JSON内容
+            if stripped.startswith("<!DOCTYPE") or stripped.startswith("<html"):
+                return False, f"版本配置文件内容为HTML错误页面（下载失败），请修复版本: {json_path}"
+            if stripped.startswith("[") and stripped.endswith("]"):
+                return False, f"版本配置文件为JSON数组而非对象，格式错误: {json_path}"
+            if len(stripped) < 10:
+                return False, f"版本配置文件内容过短，可能已损坏: {json_path}"
+            return False, f"版本配置文件格式错误，内容不是JSON对象: {json_path}"
+
+        try:
+            version_json = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            return False, f"版本配置文件 JSON 解析失败: {e}\n文件: {json_path}"
+
+        if not isinstance(version_json, dict):
+            return False, f"版本配置文件不是有效的 JSON 对象: {json_path}"
+
+        required_fields = ["id", "mainClass", "libraries"]
+        missing = [f for f in required_fields if f not in version_json]
+        if missing:
+            return False, f"版本配置文件缺少必要字段 {missing}: {json_path}"
+
+        if not isinstance(version_json.get("libraries"), list):
+            return False, f"版本配置文件 'libraries' 字段不是数组: {json_path}"
+
+        return True, ""
+
+    @staticmethod
+    def repair_version_json(version_id: str, game_dir: Path) -> bool:
+        """删除损坏的版本 JSON 文件，以便后续重新下载。
+
+        Args:
+            version_id: 版本 ID
+            game_dir: 游戏目录
+
+        Returns:
+            True 表示已删除损坏文件
+        """
+        version_dir = game_dir / "versions" / version_id
+        json_path = version_dir / f"{version_id}.json"
+
+        if not json_path.exists():
+            alt_json = version_dir / "version.json"
+            if alt_json.exists():
+                json_path = alt_json
+            else:
+                logger.warning("版本 JSON 文件不存在，无需修复: %s", version_id)
+                return False
+
+        try:
+            backup_path = json_path.with_suffix(".json.corrupted")
+            json_path.rename(backup_path)
+            logger.info("已备份损坏的版本 JSON: %s -> %s", json_path, backup_path)
+            return True
+        except OSError as e:
+            logger.error("无法删除损坏的版本 JSON: %s", e)
+            return False
 
     @staticmethod
     def _verify_version_files(version_dir: Path, version_json: dict) -> None:

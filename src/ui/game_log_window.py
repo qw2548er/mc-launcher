@@ -228,10 +228,15 @@ class GameLogWindow(QDialog):
             self.append_log("\n[Launcher] 游戏进程已正常退出", "INFO")
 
     def _show_error_dialog(self, exit_code: int) -> None:
+        crash_reason = self._scan_log_for_crash_reason()
         suggestions = []
 
+        if crash_reason:
+            suggestions.append(crash_reason["suggestion"])
+
         if exit_code == 1:
-            suggestions.append(self.tr("游戏崩溃，请检查日志获取详细信息"))
+            if not crash_reason:
+                suggestions.append(self.tr("游戏崩溃，请检查日志获取详细信息"))
         elif exit_code == -1073740791 or exit_code == 0xC0000409:
             suggestions.append(self.tr("可能是内存不足，请尝试减少内存分配"))
         elif exit_code == -1073741515 or exit_code == 0xC0000135:
@@ -241,16 +246,99 @@ class GameLogWindow(QDialog):
         elif exit_code == 137 or exit_code == -9:
             suggestions.append(self.tr("进程被强制终止"))
         else:
-            suggestions.append(self.tr("请检查游戏日志获取详细错误信息"))
-            suggestions.append(self.tr("确保已安装正确版本的 Java"))
-            suggestions.append(self.tr("尝试增加/减少内存分配"))
+            if not crash_reason:
+                suggestions.append(self.tr("请检查游戏日志获取详细错误信息"))
+                suggestions.append(self.tr("确保已安装正确版本的 Java"))
+                suggestions.append(self.tr("尝试增加/减少内存分配"))
 
         msg = self.tr("游戏异常退出！") + "\n\n" + self.tr("退出码: ") + str(exit_code) + "\n\n"
+        if crash_reason:
+            msg += self.tr("崩溃原因: ") + crash_reason["title"] + "\n\n"
         msg += self.tr("建议解决方案:") + "\n"
         for i, s in enumerate(suggestions, 1):
             msg += f"  {i}. {s}\n"
 
         self.append_log(msg, "ERROR")
+
+    _CRASH_PATTERNS = [
+        {
+            "pattern": "JsonSyntaxException.*Expected BEGIN_OBJECT but was STRING",
+            "title": "版本配置文件 JSON 损坏",
+            "suggestion": (
+                "版本配置文件（如 versions/1.7.10/1.7.10.json）已损坏或为空。\n"
+                "请点击「修复版本」重新下载，或手动删除该JSON文件后重新安装版本。"
+            ),
+        },
+        {
+            "pattern": "JsonSyntaxException",
+            "title": "JSON 配置文件解析失败",
+            "suggestion": (
+                "游戏依赖的某个 JSON 配置文件损坏。\n"
+                "请尝试点击「修复版本」重新下载，或检查 .minecraft 目录下相关 JSON 文件。"
+            ),
+        },
+        {
+            "pattern": "UnsupportedClassVersionError",
+            "title": "Java 版本不兼容",
+            "suggestion": (
+                "Java 版本不兼容当前 Minecraft 版本。\n"
+                "例如 Minecraft 1.17+ 需要 Java 17+，1.21+ 需要 Java 21+。\n"
+                "请在设置中切换为兼容的 Java 版本。"
+            ),
+        },
+        {
+            "pattern": "OutOfMemoryError",
+            "title": "内存不足",
+            "suggestion": (
+                "游戏内存不足导致崩溃。\n"
+                "请尝试在设置中增加内存分配，或关闭其他占用内存的程序。"
+            ),
+        },
+        {
+            "pattern": "ClassNotFoundException|NoClassDefFoundError",
+            "title": "游戏文件缺失",
+            "suggestion": (
+                "缺少必要游戏类文件，可能是版本下载不完整。\n"
+                "请点击「修复版本」重新下载完整版本文件。"
+            ),
+        },
+        {
+            "pattern": "UnsatisfiedLinkError.*lwjgl",
+            "title": "LWJGL 原生库加载失败",
+            "suggestion": (
+                "LWJGL 原生库加载失败，可能是显卡驱动不兼容或渲染器配置错误。\n"
+                "请尝试在设置中切换 OpenGL 渲染器为 Krypton Wrapper。"
+            ),
+        },
+        {
+            "pattern": r"java\.lang\.NullPointerException",
+            "title": "游戏空指针异常",
+            "suggestion": (
+                "游戏内部空指针异常，可能是模组兼容性问题或版本文件不完整。\n"
+                "请检查模组兼容性，或尝试修复版本。"
+            ),
+        },
+    ]
+
+    def _scan_log_for_crash_reason(self) -> Optional[dict]:
+        """扫描游戏日志，识别已知崩溃原因。
+
+        Returns:
+            dict with 'title' and 'suggestion' keys, or None
+        """
+        log_text = self._log_view.toPlainText()
+        if not log_text:
+            return None
+
+        for pattern_def in self._CRASH_PATTERNS:
+            import re
+            if re.search(pattern_def["pattern"], log_text, re.IGNORECASE):
+                return {
+                    "title": pattern_def["title"],
+                    "suggestion": pattern_def["suggestion"],
+                }
+
+        return None
 
     def _on_kill_clicked(self) -> None:
         reply = QMessageBox.warning(
