@@ -8,6 +8,7 @@
 - 资源文件集成管理
 """
 
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,7 @@ class VersionValidationResult:
     version_id: str = ""
     is_valid: bool = False
     json_exists: bool = False
+    json_corrupted: bool = False
     jar_exists: bool = False
     jar_valid: bool = False
     asset_index_exists: bool = False
@@ -64,6 +66,8 @@ class VersionValidationResult:
         issues: list[str] = []
         if not self.json_exists:
             issues.append("version.json 缺失")
+        elif self.json_corrupted:
+            issues.append("version.json 已损坏（可能导致 JsonSyntaxException 错误）")
         if not self.jar_exists:
             issues.append("客户端 jar 缺失")
         elif not self.jar_valid:
@@ -226,8 +230,21 @@ class VersionManager:
         json_path = version_dir / f"{version_id}.json"
         result.json_exists = json_path.is_file()
 
+        if result.json_exists:
+            try:
+                raw = json_path.read_text(encoding="utf-8").strip()
+                if raw.startswith('"') or not raw.startswith("{"):
+                    result.json_corrupted = True
+                else:
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        result.json_corrupted = True
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                result.json_corrupted = True
+
         meta = self._load_local_version(version_id)
         if meta is None:
+            result.is_valid = result.json_exists and not result.json_corrupted
             return result
 
         jar_path = version_dir / f"{version_id}.jar"
@@ -269,6 +286,7 @@ class VersionManager:
 
         result.is_valid = (
             result.json_exists
+            and not result.json_corrupted
             and result.jar_exists
             and result.jar_valid
             and not result.libraries_missing
@@ -358,10 +376,50 @@ class VersionManager:
         Returns:
             True 表示修复成功
         """
+        version_dir = self._versions_dir / version_id
+        json_path = version_dir / f"{version_id}.json"
+
         meta = self._load_local_version(version_id)
+
         if meta is None:
-            logger.error("版本未安装: %s", version_id)
-            return False
+            if not version_dir.exists():
+                logger.error("版本未安装: %s", version_id)
+                return False
+
+            logger.info("版本 JSON 损坏或无法加载，尝试从远程重新获取: %s", version_id)
+
+            try:
+                manifest = self.fetch_remote_versions()
+                entry = manifest.get_version(version_id)
+                if entry is None:
+                    logger.error("版本不存在于远程清单: %s", version_id)
+                    return False
+
+                ensure_directory(version_dir)
+
+                meta = self._api.fetch_version_metadata(entry.url, version_id)
+                if meta is None:
+                    logger.error("无法获取版本元数据: %s", version_id)
+                    return False
+
+                backup_path = None
+                if json_path.exists():
+                    backup_path = json_path.with_suffix(".json.corrupted")
+                    try:
+                        json_path.rename(backup_path)
+                        logger.info("已备份损坏的 version.json: %s", backup_path)
+                    except OSError:
+                        pass
+
+                write_json(json_path, meta.raw)
+                logger.info("已重新下载 version.json: %s", json_path)
+
+            except HttpError as e:
+                logger.error("从远程获取版本元数据失败: %s", e)
+                return False
+            except Exception as e:
+                logger.error("修复 version.json 失败: %s", e)
+                return False
 
         logger.info("开始修复版本: %s", version_id)
         downloader = VersionDownloader(

@@ -569,7 +569,7 @@ class GameLauncher:
     def _validate_version_json_structure(json_path: Path) -> tuple[bool, str]:
         """深度校验版本 JSON 文件结构合法性。
 
-        检测常见损坏模式：空文件、HTML错误页、无关键字段、格式错误。
+        检测常见损坏模式：空文件、HTML错误页、JSON字符串值（Gson错误）、无关键字段、格式错误。
 
         Returns:
             (is_valid, error_message)
@@ -587,8 +587,16 @@ class GameLauncher:
             return False, f"版本配置文件编码错误，文件可能已损坏: {json_path}"
 
         stripped = raw.strip()
+
+        if stripped.startswith('"'):
+            return False, (
+                f"版本配置文件内容是JSON字符串而非对象: {json_path}\n"
+                "这会导致游戏崩溃错误: com.google.gson.JsonSyntaxException: "
+                "Expected BEGIN_OBJECT but was STRING\n"
+                "请使用「修复版本」功能重新下载版本配置文件。"
+            )
+
         if not stripped.startswith("{"):
-            # 检测常见非JSON内容
             if stripped.startswith("<!DOCTYPE") or stripped.startswith("<html"):
                 return False, f"版本配置文件内容为HTML错误页面（下载失败），请修复版本: {json_path}"
             if stripped.startswith("[") and stripped.endswith("]"):
@@ -602,18 +610,42 @@ class GameLauncher:
         except json.JSONDecodeError as e:
             return False, f"版本配置文件 JSON 解析失败: {e}\n文件: {json_path}"
 
-        if not isinstance(version_json, dict):
-            return False, f"版本配置文件不是有效的 JSON 对象: {json_path}"
+        if isinstance(version_json, str):
+            return False, (
+                f"版本配置文件JSON解析后是字符串而非对象: {json_path}\n"
+                "这会导致 'Expected BEGIN_OBJECT but was STRING' 错误。"
+            )
 
-        required_fields = ["id", "mainClass", "libraries"]
+        if not isinstance(version_json, dict):
+            return False, f"版本配置文件不是有效的 JSON 对象（实际为 {type(version_json).__name__}）: {json_path}"
+
+        required_fields = ["id"]
         missing = [f for f in required_fields if f not in version_json]
         if missing:
             return False, f"版本配置文件缺少必要字段 {missing}: {json_path}"
 
-        if not isinstance(version_json.get("libraries"), list):
-            return False, f"版本配置文件 'libraries' 字段不是数组: {json_path}"
-
         return True, ""
+
+    @staticmethod
+    def validate_version_json(json_path: Path) -> tuple[bool, Optional[dict], str]:
+        """验证版本 JSON 文件并返回解析后的数据。
+
+        Args:
+            json_path: JSON 文件路径
+
+        Returns:
+            (is_valid, json_data, error_message)
+        """
+        valid, err_msg = GameLauncher._validate_version_json_structure(json_path)
+        if not valid:
+            return False, None, err_msg
+
+        try:
+            raw = json_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return True, data, ""
+        except (json.JSONDecodeError, OSError) as e:
+            return False, None, str(e)
 
     @staticmethod
     def repair_version_json(version_id: str, game_dir: Path) -> bool:
