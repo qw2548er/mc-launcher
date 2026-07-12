@@ -547,6 +547,11 @@ class GameLauncher:
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 raw = f.read()
+            # 去除 UTF-8 BOM 头
+            if raw.startswith("\ufeff"):
+                raw = raw[1:]
+            elif len(raw) >= 3 and raw[:1].encode("utf-8") == b"\xef\xbb\xbf":
+                raw = raw.encode("utf-8")[3:].decode("utf-8")
             if not raw.strip():
                 raise LaunchError(
                     f"版本配置文件为空: {json_path}\n"
@@ -586,7 +591,16 @@ class GameLauncher:
         except UnicodeDecodeError:
             return False, f"版本配置文件编码错误，文件可能已损坏: {json_path}"
 
-        stripped = raw.strip()
+        # 检测并修复 UTF-8 BOM 头 (EF BB BF)
+        bom_stripped = raw
+        if raw.startswith("\ufeff"):
+            bom_stripped = raw[1:]
+        elif len(raw) >= 3:
+            raw_bytes = raw.encode("utf-8")
+            if raw_bytes[:3] == b"\xef\xbb\xbf":
+                bom_stripped = raw_bytes[3:].decode("utf-8")
+
+        stripped = bom_stripped.strip()
 
         if stripped.startswith('"'):
             return False, (
@@ -603,12 +617,23 @@ class GameLauncher:
                 return False, f"版本配置文件为JSON数组而非对象，格式错误: {json_path}"
             if len(stripped) < 10:
                 return False, f"版本配置文件内容过短，可能已损坏: {json_path}"
+            if raw.startswith("\ufeff"):
+                return False, f"版本配置文件包含BOM头且内容损坏: {json_path}"
             return False, f"版本配置文件格式错误，内容不是JSON对象: {json_path}"
 
         try:
             version_json = json.loads(stripped)
         except json.JSONDecodeError as e:
-            return False, f"版本配置文件 JSON 解析失败: {e}\n文件: {json_path}"
+            # 如果带BOM的文件解析失败，尝试自动修复
+            if raw != bom_stripped:
+                try:
+                    json_path.write_text(bom_stripped, encoding="utf-8")
+                    logger.info("已自动修复 BOM 头: %s", json_path)
+                    version_json = json.loads(bom_stripped)
+                except (json.JSONDecodeError, OSError):
+                    return False, f"版本配置文件 JSON 解析失败（含BOM头）: {e}\n文件: {json_path}"
+            else:
+                return False, f"版本配置文件 JSON 解析失败: {e}\n文件: {json_path}"
 
         if isinstance(version_json, str):
             return False, (

@@ -262,6 +262,15 @@ class GameLogWindow(QDialog):
 
     _CRASH_PATTERNS = [
         {
+            "pattern": r"MalformedJsonException.*setLenient\(true\)",
+            "title": "JSON 文件包含非法字符（BOM头/注释）",
+            "suggestion": (
+                "版本配置文件（如 versions/1.7.10/1.7.10.json）包含BOM头或其他非法字符。\n"
+                "启动器已尝试自动修复，请重新启动游戏。\n"
+                "如仍失败，请点击「修复版本」重新下载该版本。"
+            ),
+        },
+        {
             "pattern": "JsonSyntaxException.*Expected BEGIN_OBJECT but was STRING",
             "title": "版本配置文件 JSON 损坏",
             "suggestion": (

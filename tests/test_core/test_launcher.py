@@ -52,7 +52,7 @@ class TestGameLauncher:
             version_dir.mkdir(parents=True)
 
             launcher._config.set("game_directory", str(game_dir))
-            with pytest.raises(LaunchError, match="版本配置文件"):
+            with pytest.raises(LaunchError, match="无法读取版本配置文件"):
                 launcher.launch("1.20.4", account)
 
     def test_launch_missing_jar(self, launcher, account):
@@ -232,25 +232,39 @@ class TestGameLauncher:
             assert valid is False
             assert "格式错误" in msg
 
-    def test_validate_version_json_structure_minimal_valid(self, launcher):
-        """测试校验仅包含 id 字段的最小有效 JSON。"""
+    def test_validate_version_json_structure_missing_fields(self, launcher):
+        """测试校验缺少必要字段的 JSON。"""
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "test.json"
-            json_path.write_text('{"id": "1.20.4"}')
-
-            valid, msg = GameLauncher._validate_version_json_structure(json_path)
-            assert valid is True
-            assert msg == ""
-
-    def test_validate_version_json_structure_missing_id(self, launcher):
-        """测试校验缺少 id 字段的 JSON。"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            json_path = Path(tmpdir) / "test.json"
+            # 缺少 "id" 字段
             json_path.write_text('{"mainClass": "net.minecraft.client.main.Main"}')
 
             valid, msg = GameLauncher._validate_version_json_structure(json_path)
             assert valid is False
             assert "缺少必要字段" in msg
+
+    def test_validate_version_json_structure_bom(self, launcher):
+        """测试校验带 UTF-8 BOM 头的 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "test.json"
+            data = {"id": "1.20.4", "mainClass": "net.minecraft.client.main.Main", "libraries": []}
+            # 写入带 BOM 头的 JSON
+            raw = json.dumps(data)
+            json_path.write_bytes(b"\xef\xbb\xbf" + raw.encode("utf-8"))
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is True, f"BOM JSON should be valid: {msg}"
+            assert msg == ""
+
+    def test_validate_version_json_structure_bom_corrupted(self, launcher):
+        """测试校验带 BOM 头但内容损坏的 JSON。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "test.json"
+            json_path.write_bytes(b"\xef\xbb\xbf" + b"not json at all")
+
+            valid, msg = GameLauncher._validate_version_json_structure(json_path)
+            assert valid is False
+            assert "BOM" in msg
 
     def test_validate_version_json_string_value(self, launcher):
         """测试 JSON 字符串值（Gson 错误场景）。"""
